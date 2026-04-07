@@ -1,0 +1,54 @@
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# Database
+motor==3.4.0
+pymongo==4.7.2
+
+# Redis & rate limiting
+redis==5.0.4
+slowapi==0.1.9
+
+# Vector search
+faiss-cpu==1.8.0
+
+# Embeddings
+sentence-transformers==3.0.1
+
+# Circuit breaker
+pybreaker==1.2.0
+
+# Messaging channels
+python-telegram-bot==21.3
+twilio==9.2.1
+
+# AI / transcription
+openai==1.35.3
+
+# Document parsing
+pdfplumber==0.11.1
+
+# Auth & security
+python-jose[cryptography]==3.3.0
+bcrypt==4.1.3
+passlib[bcrypt]==1.7.4
+
+# Config
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+python-multipart==0.0.9
+
+# Scheduling
+apscheduler==3.10.4
+
+# HTTP client
+httpx==0.27.0
+
+# Cryptography (for channel secrets)
+cryptography==42.0.8
+
+# Testing
+pytest==8.2.2
+pytest-asyncio==0.23.7
+pytest-mock==3.14.0

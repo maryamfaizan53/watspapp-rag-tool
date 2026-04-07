@@ -1,0 +1,652 @@
+openapi: "3.1.0"
+info:
+  title: PSX RAG Chatbot SaaS API
+  version: "1.0.0"
+  description: |
+    Admin and webhook API for the PSX RAG Chatbot SaaS platform.
+    All /admin/* routes require Bearer JWT authentication.
+    Webhook routes are authenticated via HMAC signature headers.
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: https://api.psx-chatbot.example.com
+    description: Production
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+
+    LoginResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: bearer
+        expires_in:
+          type: integer
+          description: Seconds until token expiry
+
+    Tenant:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        plan:
+          type: string
+          enum: [starter, growth, enterprise]
+        status:
+          type: string
+          enum: [active, suspended, deleted]
+        channels:
+          type: object
+          properties:
+            telegram:
+              type: object
+              properties:
+                configured:
+                  type: boolean
+            whatsapp:
+              type: object
+              properties:
+                configured:
+                  type: boolean
+                from_number:
+                  type: string
+        quota:
+          type: object
+          properties:
+            messages_per_month:
+              type: integer
+            rate_limit_per_minute:
+              type: integer
+        usage:
+          type: object
+          properties:
+            message_count_month:
+              type: integer
+            active_users_month:
+              type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    TenantCreate:
+      type: object
+      required: [name, plan]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        plan:
+          type: string
+          enum: [starter, growth, enterprise]
+        quota:
+          type: object
+          properties:
+            messages_per_month:
+              type: integer
+              minimum: 1
+            rate_limit_per_minute:
+              type: integer
+              minimum: 1
+              maximum: 600
+
+    TenantChannelConfig:
+      type: object
+      properties:
+        telegram:
+          type: object
+          properties:
+            bot_token:
+              type: string
+              description: Telegram bot token from BotFather
+        whatsapp:
+          type: object
+          properties:
+            account_sid:
+              type: string
+            auth_token:
+              type: string
+            from_number:
+              type: string
+              pattern: '^\+[1-9]\d{1,14}$'
+
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, ready, failed]
+        file_size_bytes:
+          type: integer
+        mime_type:
+          type: string
+        chunk_count:
+          type: integer
+        uploaded_at:
+          type: string
+          format: date-time
+        ready_at:
+          type: string
+          format: date-time
+        error_message:
+          type: string
+
+    TenantMetrics:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+        period:
+          type: string
+          description: ISO date range
+        message_count:
+          type: integer
+        active_users:
+          type: integer
+        voice_message_count:
+          type: integer
+        avg_latency_ms:
+          type: integer
+        daily_breakdown:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              message_count:
+                type: integer
+              active_users:
+                type: integer
+
+    TelegramUpdate:
+      type: object
+      description: Telegram Bot API Update object (subset)
+      properties:
+        update_id:
+          type: integer
+        message:
+          type: object
+
+    TwilioWebhook:
+      type: object
+      description: Twilio WhatsApp webhook form fields
+      properties:
+        MessageSid:
+          type: string
+        From:
+          type: string
+        Body:
+          type: string
+        MediaUrl0:
+          type: string
+        MediaContentType0:
+          type: string
+
+paths:
+
+  # ── Auth ──────────────────────────────────────────────────────────────
+  /auth/login:
+    post:
+      summary: Admin login
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        "200":
+          description: JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout:
+    post:
+      summary: Invalidate current token
+      tags: [Auth]
+      security:
+        - BearerAuth: []
+      responses:
+        "204":
+          description: Logged out
+
+  # ── Tenants ───────────────────────────────────────────────────────────
+  /admin/tenants:
+    get:
+      summary: List all tenants
+      tags: [Tenants]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, suspended, deleted]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: Paginated tenant list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tenant'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  pages:
+                    type: integer
+
+    post:
+      summary: Create tenant
+      tags: [Tenants]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreate'
+      responses:
+        "201":
+          description: Tenant created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        "409":
+          description: Tenant name already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/tenants/{tenant_id}:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get tenant by ID
+      tags: [Tenants]
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+          description: Tenant
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    put:
+      summary: Update tenant (name, plan, quota)
+      tags: [Tenants]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreate'
+      responses:
+        "200":
+          description: Updated tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+
+    delete:
+      summary: Delete tenant and all associated data
+      tags: [Tenants]
+      security:
+        - BearerAuth: []
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/tenants/{tenant_id}/channels:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Configure bot channel credentials
+      tags: [Tenants]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantChannelConfig'
+      responses:
+        "200":
+          description: Channels configured
+        "422":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Documents ─────────────────────────────────────────────────────────
+  /admin/tenants/{tenant_id}/documents:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List documents for tenant
+      tags: [Documents]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, processing, ready, failed]
+      responses:
+        "200":
+          description: Document list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Document'
+                  total:
+                    type: integer
+
+    post:
+      summary: Upload document to knowledge base
+      tags: [Documents]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PDF or plain text, max 50 MB
+      responses:
+        "202":
+          description: Accepted for ingestion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        "409":
+          description: Duplicate document (same content hash already exists)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "413":
+          description: File too large (exceeds 50 MB)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "415":
+          description: Unsupported file type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/tenants/{tenant_id}/documents/{document_id}:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: document_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get document status
+      tags: [Documents]
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+    delete:
+      summary: Delete document and its vector chunks
+      tags: [Documents]
+      security:
+        - BearerAuth: []
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Metrics ───────────────────────────────────────────────────────────
+  /admin/tenants/{tenant_id}/metrics:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Usage metrics for tenant
+      tags: [Metrics]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantMetrics'
+
+  # ── Webhooks ──────────────────────────────────────────────────────────
+  /webhooks/telegram/{tenant_id}:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Telegram Bot API webhook receiver
+      tags: [Webhooks]
+      description: |
+        Receives Telegram Update objects. Authenticated via secret_token
+        query parameter set during webhook registration with Telegram.
+      parameters:
+        - name: secret_token
+          in: query
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelegramUpdate'
+      responses:
+        "200":
+          description: Acknowledged (processing in background)
+
+  /webhooks/whatsapp/{tenant_id}:
+    parameters:
+      - name: tenant_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Twilio WhatsApp webhook receiver
+      tags: [Webhooks]
+      description: |
+        Receives Twilio WhatsApp message webhooks. Authenticated via
+        Twilio request signature in X-Twilio-Signature header.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TwilioWebhook'
+      responses:
+        "200":
+          description: Acknowledged
+          content:
+            application/xml:
+              example: "<Response/>"
+        "403":
+          description: Invalid Twilio signature
+
+  # ── Health ────────────────────────────────────────────────────────────
+  /health:
+    get:
+      summary: Service health check
+      tags: [Health]
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                  dependencies:
+                    type: object
+                    properties:
+                      mongodb:
+                        type: string
+                        enum: [ok, degraded, down]
+                      ollama:
+                        type: string
+                        enum: [ok, degraded, down]
+                      redis:
+                        type: string
+                        enum: [ok, degraded, down]
+        "503":
+          description: Unhealthy
