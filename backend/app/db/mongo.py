@@ -1,4 +1,5 @@
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.server_api import ServerApi
 
 from app.config import settings
 
@@ -8,7 +9,7 @@ _db: AsyncIOMotorDatabase | None = None
 
 async def connect_db() -> None:
     global _client, _db
-    _client = AsyncIOMotorClient(settings.mongodb_uri)
+    _client = AsyncIOMotorClient(settings.mongodb_uri, server_api=ServerApi("1"))
     _db = _client.get_default_database()
     await _create_indexes()
 
