@@ -10,7 +10,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.api import auth, documents, health, metrics, tenants, webhooks
 from app.config import settings
-from app.db.mongo import close_db, connect_db
+from app.db.postgres import close_db, connect_db
 from app.db.redis import close_redis, connect_redis
 from app.services.rate_limiter import limiter
 from app.services.usage_worker import start_worker, stop_worker
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Connecting to MongoDB...")
+    logger.info("Connecting to PostgreSQL...")
     await connect_db()
     logger.info("Connecting to Redis...")
     await connect_redis()
@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     stop_worker()
-    logger.info("Disconnecting from MongoDB and Redis...")
+    logger.info("Disconnecting from PostgreSQL and Redis...")
     await close_db()
     await close_redis()
 

@@ -1,8 +1,10 @@
 import httpx
 from fastapi import APIRouter
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.mongo import get_db
+from app.db.postgres import AsyncSessionLocal
 from app.db.redis import get_redis
 
 router = APIRouter(tags=["Health"])
@@ -12,12 +14,13 @@ router = APIRouter(tags=["Health"])
 async def health_check() -> dict:
     deps: dict[str, str] = {}
 
-    # MongoDB
+    # PostgreSQL
     try:
-        await get_db().command("ping")
-        deps["mongodb"] = "ok"
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+            deps["postgresql"] = "ok"
     except Exception:
-        deps["mongodb"] = "down"
+        deps["postgresql"] = "down"
 
     # Ollama
     try:
