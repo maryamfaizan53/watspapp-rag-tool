@@ -14,15 +14,22 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
 
+    # LLM Provider (ollama, gemini)
+    llm_provider: str = "ollama"
+
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
+
+    # Gemini
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-1.5-flash"
 
     # Redis
     redis_url: str = "redis://localhost:6379"
 
     # Embeddings
-    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    embedding_model: str = "intfloat/multilingual-e5-small"
 
     # FAISS
     faiss_index_dir: str = "./indexes"

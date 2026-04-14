@@ -1,0 +1,6 @@
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+Date: Mon, 13 Apr 2026 21:45:26 GMT
+Content-Length: 67
+
+{"error":"invalid character '\\\\' looking for beginning of value"}

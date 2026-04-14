@@ -1,10 +1,35 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from app.config import settings
+from urllib.parse import urlparse, urlunparse
+
+# Parse database URL and handle SSL for asyncpg
+database_url = settings.database_url
+
+# If URL has sslmode parameter, convert it for asyncpg compatibility
+if 'sslmode' in database_url:
+    # Parse the URL
+    parsed = urlparse(database_url)
+    # Remove sslmode from query
+    query_params = parsed.query.split('&')
+    query_params = [p for p in query_params if not p.startswith('sslmode')]
+    new_query = '&'.join(query_params)
+    # Rebuild URL without sslmode
+    database_url = urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment
+    ))
+    # Add ssl parameter for asyncpg
+    if 'neon.tech' in database_url:
+        database_url += '?ssl=require'
 
 # Create async engine
 engine = create_async_engine(
-    settings.database_url,
+    database_url,
     echo=False,
     future=True,
     pool_pre_ping=True,

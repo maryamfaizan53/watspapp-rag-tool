@@ -1,17 +1,17 @@
 """
 Integration test: document upload → ingestion pipeline → RAG query returns content.
 """
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-from bson import ObjectId
 from httpx import ASGITransport, AsyncClient
 
 from app.api.auth import get_current_admin
-from app.models.admin_user import AdminUser
+from app.db.models import AdminUser
 
-TENANT_ID = str(ObjectId())
+TENANT_ID = uuid.uuid4()
 
 FIXTURE_TEXT = (
     "OGDC Annual Report 2024. "
@@ -23,7 +23,7 @@ FIXTURE_TEXT = (
 
 def _fake_admin() -> AdminUser:
     return AdminUser(
-        id=str(ObjectId()),
+        id=uuid.uuid4(),
         email="admin@test.com",
         hashed_password="x",
         role="super_admin",
@@ -51,9 +51,8 @@ def _common_patches(mock_db):
 @pytest.mark.asyncio
 async def test_upload_document_accepted():
     """POST /admin/tenants/{id}/documents with a valid TXT file returns HTTP 202."""
-    mock_db = MagicMock()
-    mock_db.documents.find_one = AsyncMock(return_value=None)
-    mock_db.documents.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+    mock_db = AsyncMock()
+    mock_db.execute.return_value.scalar_one_or_none.return_value = None
 
     patches = _common_patches(mock_db) + [
         patch("app.api.documents.process_document", new_callable=AsyncMock),
@@ -87,10 +86,11 @@ async def test_duplicate_document_returns_409():
 
     existing_hash = hashlib.sha256(FIXTURE_TEXT.encode()).hexdigest()
 
-    mock_db = MagicMock()
-    mock_db.documents.find_one = AsyncMock(
-        return_value={"_id": ObjectId(), "content_hash": existing_hash}
-    )
+    mock_db = AsyncMock()
+    
+    existing_doc = MagicMock()
+    existing_doc.content_hash = existing_hash
+    mock_db.execute.return_value.scalar_one_or_none.return_value = existing_doc
 
     patches = _common_patches(mock_db)
     entered = [p.__enter__() for p in patches]
@@ -130,30 +130,32 @@ async def test_ingestion_pipeline_content_queryable_via_rag():
     assert "7.3" in all_text
     assert len(chunks) >= 1
 
-    mock_db = MagicMock()
-    chunk_id = str(ObjectId())
-    mock_db.document_chunks.find.return_value.to_list = AsyncMock(
-        return_value=[{"_id": ObjectId(chunk_id), "text": chunks[0]["text"]}]
-    )
-    mock_db.messages.find.return_value.sort.return_value.limit.return_value.to_list = AsyncMock(
-        return_value=[]
-    )
+    mock_db = AsyncMock()
+    
+    chunk = MagicMock()
+    chunk.id = uuid.uuid4()
+    chunk.text = chunks[0]["text"]
+    
+    async def mock_execute(query):
+        result = MagicMock()
+        if "document_chunks" in str(query):
+            result.scalar_one_or_none.return_value = chunk
+        elif "messages" in str(query):
+            result.scalars.return_value.all.return_value = []
+        return result
+    
+    mock_db.execute.side_effect = mock_execute
 
     query_vector = np.zeros(384, dtype="float32")
 
     with (
         patch("app.services.rag.embeddings.embed_text", return_value=query_vector),
-        patch("app.services.rag.faiss_store.search", return_value=[(chunk_id, 0.05)]),
-        patch("app.services.rag.get_db", return_value=mock_db),
-        patch(
-            "app.services.rag.llm.safe_generate",
-            new_callable=AsyncMock,
-            return_value="OGDC EPS is PKR 45.23 for FY2024.",
-        ),
+        patch("app.services.rag.faiss_store.search", return_value=[(f"{uuid.uuid4()}_0", 0.05)]),
+        patch("app.services.rag.llm.safe_generate", new_callable=AsyncMock, return_value="OGDC EPS is PKR 45.23 for FY2024."),
     ):
         from app.services.rag import FALLBACK_NO_DATA, answer_query
 
-        answer, _ = await answer_query(str(ObjectId()), str(ObjectId()), "What is OGDC EPS?")
+        answer, _ = await answer_query(mock_db, uuid.uuid4(), uuid.uuid4(), "What is OGDC EPS?")
 
     assert answer != FALLBACK_NO_DATA
     assert "45.23" in answer or "EPS" in answer
