@@ -62,6 +62,8 @@ services:
       - DATABASE_URL=postgresql+asyncpg://user:pass@db:5432/psx_chatbot
       - REDIS_URL=redis://redis:6379
       - OLLAMA_BASE_URL=http://ollama:11434
+      - HF_HOME=/tmp/hf_cache
+      - FASTEMBED_CACHE_PATH=/tmp/fastembed_cache
     volumes:
       - ./indexes:/app/indexes
     depends_on:
