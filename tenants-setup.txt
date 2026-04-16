@@ -1,0 +1,93 @@
+  Deployment
+
+  Where to deploy
+
+  The best free/cheap options for this stack:
+
+  ┌────────────────────────────┬─────────────────────────────────────────────┬──────────────┐
+  │          Service           │                  Best for                   │     Cost     │
+  ├────────────────────────────┼─────────────────────────────────────────────┼──────────────┤
+  │ Railway                    │ Easiest — Docker Compose supported natively │ ~$5/mo       │
+  ├────────────────────────────┼─────────────────────────────────────────────┼──────────────┤
+  │ Render                     │ Good free tier for backend + PostgreSQL     │ Free → $7/mo │
+  ├────────────────────────────┼─────────────────────────────────────────────┼──────────────┤
+  │ DigitalOcean App Platform  │ One-click Docker deploys                    │ $5–12/mo     │
+  ├────────────────────────────┼─────────────────────────────────────────────┼──────────────┤
+  │ VPS (DigitalOcean/Hetzner) │ Full control, cheapest long term            │ $4–6/mo      │
+  └────────────────────────────┴─────────────────────────────────────────────┴──────────────┘
+
+  Recommended: Railway or a $6/mo Hetzner VPS (most control, cheapest).
+
+  ---
+  Deploying to a VPS (recommended path)
+
+  # 1. On your VPS (Ubuntu 22.04)
+  apt install docker.io docker-compose-plugin -y
+
+  # 2. Clone your repo
+  git clone https://github.com/your-repo/watspapp-rag-tool
+  cd watspapp-rag-tool
+  
+  cp .env.example .env   # fill in production values
+
+  # 3. Point a domain at your VPS IP, then get SSL via Caddy
+  apt install caddy -y
+
+  Add a Caddyfile:
+  api.yourdomain.com {
+      reverse_proxy localhost:8080
+  }
+  app.yourdomain.com {
+      reverse_proxy localhost:5180
+  }
+
+  # 4. Start everything
+  docker compose up -d
+
+  # 5. Register Telegram webhook with your real domain
+  curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+    -d '{"url":"https://api.yourdomain.com/webhooks/telegram/<tenant_id>"}'
+
+  Caddy handles HTTPS automatically — Telegram requires HTTPS for webhooks.
+
+  ---
+  Onboarding New Clients (Multi-Tenant)
+
+  The system is already multi-tenant. Here's the workflow for each new client:
+
+  Step 1 — Create a tenant via the admin UI
+
+  Go to http://localhost:5180 → Tenants → New Tenant. Fill in name and plan.
+
+  Step 2 — Configure their Telegram bot
+
+  Each client needs their own Telegram bot (created via @BotFather). Enter their bot token in the tenant's  
+  channel config.
+
+  Step 3 — Register their webhook
+
+  curl -X POST "https://api.telegram.org/bot<CLIENT_BOT_TOKEN>/setWebhook" \
+    -d '{"url":"https://api.yourdomain.com/webhooks/telegram/<NEW_TENANT_ID>"}'
+
+  Each tenant gets a unique webhook URL with their tenant_id — the system routes messages to the correct    
+  knowledge base automatically.
+
+  Step 4 — Upload their documents
+
+  Upload their PDFs/TXTs via the admin UI → tenant → Documents. Each tenant's FAISS index is isolated by    
+  tenant_id.
+
+  Step 5 — Done
+
+  Their users message the bot → RAG retrieves from their private knowledge base → Gemini answers.
+
+  ---
+  Production checklist before going live
+
+  - Replace JWT_SECRET with a strong random value
+  - Set DISABLE_DOCS=true to hide /docs
+  - Use a managed PostgreSQL (Neon, Supabase, or RDS) instead of Docker Postgres
+  - Use a managed Redis (Upstash free tier works)
+  - Set ENVIRONMENT=production
+  - Put Caddy or nginx in front for HTTPS + rate limiting
+  - Set FRONTEND_URL to your real domain for CORS

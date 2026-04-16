@@ -1,15 +1,16 @@
 from datetime import datetime, timedelta, timezone
 
-from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.mongo import get_db
-from app.models.admin_user import AdminUser
+from app.db import get_db
+from app.db.models import AdminUser
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -52,6 +53,7 @@ def create_access_token(subject: str) -> str:
 
 async def get_current_admin(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
 ) -> AdminUser:
     token = credentials.credentials
     try:
@@ -62,34 +64,39 @@ async def get_current_admin(
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    db = get_db()
-    doc = await db.admin_users.find_one({"_id": ObjectId(admin_id), "is_active": True})
-    if not doc:
+    result = await db.execute(
+        select(AdminUser).where(AdminUser.id == admin_id, AdminUser.is_active == True)
+    )
+    admin = result.scalar_one_or_none()
+    if not admin:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
-    doc["_id"] = str(doc["_id"])
-    return AdminUser(**doc)
+    return admin
 
 
 # ── Routes ────────────────────────────────────────────────────────────
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest) -> LoginResponse:
-    db = get_db()
-    doc = await db.admin_users.find_one({"email": body.email.lower(), "is_active": True})
-    if not doc or not verify_password(body.password, doc["hashed_password"]):
+async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)) -> LoginResponse:
+    result = await db.execute(
+        select(AdminUser).where(
+            AdminUser.email == body.email.lower(),
+            AdminUser.is_active == True
+        )
+    )
+    admin = result.scalar_one_or_none()
+
+    if not admin or not verify_password(body.password, admin.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
 
     # Update last_login_at
-    await db.admin_users.update_one(
-        {"_id": doc["_id"]},
-        {"$set": {"last_login_at": datetime.now(timezone.utc)}},
-    )
+    admin.last_login_at = datetime.now(timezone.utc)
+    await db.commit()
 
-    token = create_access_token(str(doc["_id"]))
+    token = create_access_token(str(admin.id))
     return LoginResponse(
         access_token=token,
         expires_in=settings.jwt_expire_minutes * 60,

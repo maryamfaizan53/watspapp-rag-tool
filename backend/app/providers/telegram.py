@@ -107,11 +107,14 @@ async def get_file_bytes(bot_token: str, file_id: str) -> tuple[bytes, str]:
 
 async def send_text_reply(bot_token: str, chat_id: str, text: str) -> None:
     """Send a text message reply via Telegram Bot API."""
+    # Telegram max message length is 4096 chars
+    if len(text) > 4000:
+        text = text[:4000] + "..."
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
                 f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                json={"chat_id": chat_id, "text": text},
             )
             resp.raise_for_status()
         except Exception as exc:

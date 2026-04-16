@@ -1,4 +1,6 @@
 """Unit tests for the document ingestion service (app/services/ingestion.py)."""
+import uuid
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -44,66 +46,66 @@ def test_compute_sha256_differs_for_different_content():
 # ── Status transitions ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_process_document_marks_failed_on_missing_bytes():
-    """If _file_bytes is absent, ingestion sets status=failed."""
-    from bson import ObjectId
+async def test_process_document_marks_failed_on_missing_file():
+    """If file is absent, ingestion sets status=failed."""
+    doc_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    
+    mock_doc = MagicMock()
+    mock_doc.id = doc_id
+    mock_doc.mime_type = "application/pdf"
+    
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_doc
+    
+    mock_session_factory = MagicMock()
+    mock_session_factory.return_value.__aenter__.return_value = mock_db
 
-    doc_id = ObjectId()
-    mock_db = MagicMock()
-    mock_db.documents.find_one = AsyncMock(
-        return_value={"_id": doc_id, "mime_type": "application/pdf", "_file_bytes": None}
-    )
-    mock_db.documents.update_one = AsyncMock()
-
-    with patch("app.services.ingestion.get_db", return_value=mock_db):
+    with patch("app.services.ingestion.AsyncSessionLocal", new=mock_session_factory):
         from app.services.ingestion import process_document
 
-        await process_document(str(ObjectId()), str(doc_id))
+        # Pass a non-existent file path
+        await process_document(str(tenant_id), str(doc_id), "non_existent_file.bin")
 
-    # Last update_one call should set status=failed
-    calls = mock_db.documents.update_one.call_args_list
-    last_call_set = calls[-1][0][1]["$set"]
-    assert last_call_set["status"] == "failed"
+    assert mock_doc.status == "failed"
+    assert "No such file or directory" in mock_doc.error_message
 
 
 @pytest.mark.asyncio
 async def test_process_document_happy_path_marks_ready():
     """A valid plain-text document goes through pending→processing→ready."""
-    from bson import ObjectId
-
-    doc_id = ObjectId()
-    inserted_ids = [ObjectId(), ObjectId()]
-
-    mock_db = MagicMock()
-    mock_db.documents.find_one = AsyncMock(
-        return_value={
-            "_id": doc_id,
-            "mime_type": "text/plain",
-            "_file_bytes": b"Hello PSX. " * 100,
-        }
-    )
-    mock_db.documents.update_one = AsyncMock()
-    mock_db.document_chunks.insert_many = AsyncMock(
-        return_value=MagicMock(inserted_ids=inserted_ids)
-    )
+    doc_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    
+    mock_doc = MagicMock()
+    mock_doc.id = doc_id
+    mock_doc.mime_type = "text/plain"
+    
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_doc
+    
+    mock_session_factory = MagicMock()
+    mock_session_factory.return_value.__aenter__.return_value = mock_db
 
     import numpy as np
-
-    tenant_id = str(ObjectId())
     dummy_vectors = np.zeros((1, 384), dtype="float32")
+    
+    temp_file = "test_ingest.txt"
+    with open(temp_file, "wb") as f:
+        f.write(b"Hello PSX. " * 100)
 
-    with (
-        patch("app.services.ingestion.get_db", return_value=mock_db),
-        patch("app.services.ingestion.embed_batch", return_value=dummy_vectors),
-        patch("app.services.ingestion.faiss_store.add_vectors", return_value=[0]),
-        patch("app.services.ingestion.faiss_store.load_index", return_value=(MagicMock(), {})),
-        patch("app.services.ingestion.faiss_store.save_index"),
-    ):
-        from app.services.ingestion import process_document
+    try:
+        with (
+            patch("app.services.ingestion.embed_batch", return_value=dummy_vectors),
+            patch("app.services.ingestion.faiss_store.add_vectors", return_value=[0]),
+            patch("app.services.ingestion.AsyncSessionLocal", new=mock_session_factory),
+        ):
+            from app.services.ingestion import process_document
 
-        await process_document(tenant_id, str(doc_id))
+            await process_document(str(tenant_id), str(doc_id), temp_file)
 
-    calls = mock_db.documents.update_one.call_args_list
-    statuses = [c[0][1]["$set"]["status"] for c in calls]
-    assert "processing" in statuses
-    assert "ready" in statuses
+        assert mock_doc.status == "ready"
+        assert mock_doc.chunk_count > 0
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)

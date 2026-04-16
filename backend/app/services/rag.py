@@ -1,12 +1,15 @@
 import logging
 from datetime import datetime, timezone
+from uuid import UUID
 
-from bson import ObjectId
+from sqlalchemy import select, update, desc
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import faiss_store
-from app.db.mongo import get_db
-from app.models.conversation import Conversation
+from app.db.models import Conversation, Message, DocumentChunk
+from app.schemas.conversation import ConversationStatus
 from app.services import embeddings, llm
+from app.services.psx_tools import GEMINI_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +22,18 @@ FALLBACK_LLM_DOWN = (
 )
 
 SYSTEM_PROMPT = """You are a helpful PSX (Pakistan Stock Exchange) financial assistant.
-Answer questions ONLY about PSX-listed companies, stock market data, financial reports,
-and related topics. If the question is not about PSX or financial markets, politely
-decline and explain you only cover PSX-related topics.
+Answer questions about PSX-listed companies, stock market data, financial reports, and related topics.
+If the question is not about PSX or financial markets, politely decline.
 
-Use the provided context to answer accurately. If the context does not contain enough
-information, say so honestly rather than guessing.
+You have access to live PSX market data tools. Use them when the user asks about:
+- Current/live/today's stock prices
+- KSE-100 index value
+- Company details (market cap, P/E ratio, 52-week high/low)
+- Finding a stock symbol by company name
 
-Context:
+For questions about general PSX knowledge, regulations, or historical info, use the context below.
+
+Context from knowledge base:
 {context}
 
 Conversation history:
@@ -38,101 +45,145 @@ Answer:"""
 
 
 async def get_or_create_conversation(
-    tenant_id: str,
-    bot_user_id: str,
+    db: AsyncSession,
+    tenant_id: str | UUID,
+    bot_user_id: str | UUID,
     platform: str,
 ) -> Conversation:
     """Find the active session or create a new one (30-min inactivity rule)."""
-    db = get_db()
-    doc = await db.conversations.find_one(
-        {"tenant_id": ObjectId(tenant_id), "bot_user_id": ObjectId(bot_user_id)},
-        sort=[("last_message_at", -1)],
-    )
+    tid = UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+    buid = UUID(bot_user_id) if isinstance(bot_user_id, str) else bot_user_id
 
-    if doc:
-        doc["_id"] = str(doc["_id"])
-        doc["tenant_id"] = str(doc["tenant_id"])
-        doc["bot_user_id"] = str(doc["bot_user_id"])
-        conv = Conversation(**doc)
-        if not conv.is_expired():
+    query = (
+        select(Conversation)
+        .where(Conversation.tenant_id == tid, Conversation.bot_user_id == buid)
+        .order_by(desc(Conversation.last_message_at))
+        .limit(1)
+    )
+    result = await db.execute(query)
+    conv = result.scalar_one_or_none()
+
+    if conv:
+        # Check if expired (30 mins)
+        now = datetime.now(timezone.utc)
+        last = conv.last_message_at
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        
+        if (now - last).total_seconds() <= 1800:
             return conv
 
     # Create new conversation
     new_conv = Conversation(
-        tenant_id=tenant_id,
-        bot_user_id=bot_user_id,
+        tenant_id=tid,
+        bot_user_id=buid,
         platform=platform,
+        started_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+        message_count=0,
+        status="active",
     )
-    result = await db.conversations.insert_one(new_conv.to_doc())
-    new_conv.id = str(result.inserted_id)
+    db.add(new_conv)
+    await db.commit()
+    await db.refresh(new_conv)
     return new_conv
 
 
-async def update_conversation(conversation_id: str) -> None:
+async def update_conversation(db: AsyncSession, conversation_id: str | UUID) -> None:
     """Bump last_message_at and increment message_count."""
-    db = get_db()
-    await db.conversations.update_one(
-        {"_id": ObjectId(conversation_id)},
-        {
-            "$set": {"last_message_at": datetime.now(timezone.utc)},
-            "$inc": {"message_count": 1},
-        },
+    cid = UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
+    
+    query = (
+        update(Conversation)
+        .where(Conversation.id == cid)
+        .values(
+            last_message_at=datetime.now(timezone.utc),
+            message_count=Conversation.message_count + 1
+        )
     )
+    await db.execute(query)
+    await db.commit()
 
 
-async def _get_recent_history(conversation_id: str, limit: int = 5) -> list[dict]:
+async def _get_recent_history(db: AsyncSession, conversation_id: UUID, limit: int = 5) -> list[Message]:
     """Fetch the last N messages from a conversation."""
-    db = get_db()
-    cursor = (
-        db.messages.find({"conversation_id": ObjectId(conversation_id)})
-        .sort("timestamp", -1)
+    query = (
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(desc(Message.timestamp))
         .limit(limit)
     )
-    docs = await cursor.to_list(length=limit)
-    docs.reverse()  # chronological order
-    return docs
+    result = await db.execute(query)
+    messages = list(result.scalars().all())
+    messages.reverse()  # chronological order
+    return messages
 
 
 async def answer_query(
-    tenant_id: str,
-    conversation_id: str,
+    db: AsyncSession,
+    tenant_id: str | UUID,
+    conversation_id: str | UUID,
     query_text: str,
 ) -> tuple[str, list[str]]:
     """
     Full RAG pipeline: embed → search → prompt → generate.
     Returns (answer_text, list_of_chunk_ids_used).
     """
+    tid = str(tenant_id)
+    cid = UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
+
     # 1. Embed the query
     query_vector = embeddings.embed_text(query_text)
 
     # 2. FAISS similarity search
-    results = faiss_store.search(tenant_id, query_vector, top_k=5)
+    results = faiss_store.search(tid, query_vector, top_k=5)
     if not results:
         return FALLBACK_NO_DATA, []
 
-    # 3. Fetch chunk texts from MongoDB
-    db = get_db()
-    chunk_ids = [chunk_id for chunk_id, _ in results]
-    cursor = db.document_chunks.find(
-        {"_id": {"$in": [ObjectId(cid) for cid in chunk_ids]}}
-    )
-    chunk_docs = await cursor.to_list(length=10)
-    context = "\n\n".join(doc["text"] for doc in chunk_docs)
+    # 3. Fetch chunk texts from PostgreSQL
+    # results contains (placeholder_chunk_id, distance)
+    # Our placeholder_chunk_id was f"{document_id}_{chunk_index}"
+    # But we can also search by faiss_vector_id if we store it.
+    # faiss_store returns the placeholder string we gave it.
+    
+    # Let's extract document_id and chunk_index from placeholder
+    context_parts = []
+    chunk_ids_used = []
+    
+    for placeholder, _ in results:
+        try:
+            doc_id_str, chunk_idx_str = placeholder.split("_")
+            did = UUID(doc_id_str)
+            cidx = int(chunk_idx_str)
+            
+            query = select(DocumentChunk).where(
+                DocumentChunk.document_id == did,
+                DocumentChunk.chunk_index == cidx
+            )
+            res = await db.execute(query)
+            chunk = res.scalar_one_or_none()
+            if chunk:
+                context_parts.append(chunk.text)
+                chunk_ids_used.append(str(chunk.id))
+        except Exception:
+            logger.warning("Failed to parse FAISS placeholder: %s", placeholder)
+
+    context = "\n\n".join(context_parts)
 
     # 4. Build conversation history string
-    history_docs = await _get_recent_history(conversation_id)
+    history_msgs = await _get_recent_history(db, cid)
     history_lines = []
-    for msg in history_docs:
-        role = "User" if msg["role"] == "user" else "Assistant"
-        text = msg.get("transcription") or msg.get("content", "")
+    for msg in history_msgs:
+        role = "User" if msg.role == "user" else "Assistant"
+        text = msg.transcription or msg.content or ""
         history_lines.append(f"{role}: {text}")
     history = "\n".join(history_lines) if history_lines else "No prior conversation."
 
-    # 5. Build prompt and call LLM
+    # 5. Build prompt and call LLM with live PSX tools
     prompt = SYSTEM_PROMPT.format(context=context, history=history, question=query_text)
-    answer = await llm.safe_generate(prompt)
+    answer = await llm.safe_generate_with_tools(prompt, GEMINI_TOOLS)
 
     if answer is None:
         return FALLBACK_LLM_DOWN, []
 
-    return answer, chunk_ids
+    return answer, chunk_ids_used

@@ -1,9 +1,9 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
+from uuid import UUID
 
-from bson import ObjectId
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class TenantPlan(str, Enum):
@@ -37,7 +37,7 @@ class ChannelConfig(BaseModel):
 
 
 class TenantQuota(BaseModel):
-    messages_per_month: int = 10_000
+    messages_per_month: int = 5_000
     rate_limit_per_minute: int = 60
 
 
@@ -46,23 +46,28 @@ class TenantUsage(BaseModel):
     active_users_month: int = 0
 
 
-class Tenant(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
+class TenantBase(BaseModel):
     name: str
     plan: TenantPlan = TenantPlan.starter
     status: TenantStatus = TenantStatus.active
     channels: ChannelConfig = Field(default_factory=ChannelConfig)
     quota: TenantQuota = Field(default_factory=TenantQuota)
     usage: TenantUsage = Field(default_factory=TenantUsage)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-    class Config:
-        populate_by_name = True
-        arbitrary_types_allowed = True
 
-    def to_doc(self) -> dict:
-        data = self.model_dump(by_alias=False, exclude={"id"})
-        if self.id:
-            data["_id"] = ObjectId(self.id)
-        return data
+class TenantCreate(TenantBase):
+    pass
+
+
+class TenantUpdate(TenantBase):
+    name: Optional[str] = None
+    plan: Optional[TenantPlan] = None
+    status: Optional[TenantStatus] = None
+
+
+class TenantSchema(TenantBase):
+    id: UUID
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

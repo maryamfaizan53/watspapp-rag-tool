@@ -1,71 +1,91 @@
+import hashlib
+import hmac
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
-from twilio.request_validator import RequestValidator
 
 logger = logging.getLogger(__name__)
+
+GRAPH_API_VERSION = "v19.0"
+GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
 @dataclass
 class WhatsAppMessage:
-    from_number: str       # E.164 sender number
-    body: str              # text body (may be empty for media-only messages)
-    media_url: Optional[str] = None
-    media_content_type: Optional[str] = None
+    from_number: str        # E.164 sender number e.g. "923001234567"
+    body: str               # text body
+    message_id: str         # Meta message ID (for deduplication)
+    display_name: str = ""  # sender's WhatsApp display name
 
 
-class InvalidTwilioSignatureError(Exception):
+class InvalidSignatureError(Exception):
     pass
 
 
-def validate_signature(
-    auth_token: str,
-    request_url: str,
-    post_params: dict,
-    signature: str,
-) -> None:
-    """Raise InvalidTwilioSignatureError if the Twilio HMAC signature is invalid."""
-    validator = RequestValidator(auth_token)
-    if not validator.validate(request_url, post_params, signature):
-        raise InvalidTwilioSignatureError("Invalid X-Twilio-Signature")
+def verify_signature(app_secret: str, payload_bytes: bytes, signature_header: str) -> None:
+    """Raise InvalidSignatureError if the Meta X-Hub-Signature-256 is invalid."""
+    expected = "sha256=" + hmac.new(
+        app_secret.encode(), payload_bytes, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature_header):
+        raise InvalidSignatureError("Invalid X-Hub-Signature-256")
 
 
-def parse_webhook(form_data: dict) -> WhatsAppMessage:
-    """Parse a Twilio WhatsApp webhook form dict into a WhatsAppMessage."""
-    return WhatsAppMessage(
-        from_number=form_data.get("From", "").replace("whatsapp:", ""),
-        body=form_data.get("Body", ""),
-        media_url=form_data.get("MediaUrl0"),
-        media_content_type=form_data.get("MediaContentType0"),
-    )
+def parse_webhook(payload: dict) -> Optional[WhatsAppMessage]:
+    """
+    Parse a Meta WhatsApp Cloud API webhook payload.
+    Returns None if the event is not an incoming text message.
+    """
+    try:
+        entry = payload["entry"][0]
+        change = entry["changes"][0]
+        value = change["value"]
 
+        messages = value.get("messages")
+        if not messages:
+            return None
 
-async def download_media(media_url: str, account_sid: str, auth_token: str) -> bytes:
-    """Download media file from Twilio CDN using Basic Auth."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(media_url, auth=(account_sid, auth_token))
-        resp.raise_for_status()
-        return resp.content
+        msg = messages[0]
+        if msg.get("type") != "text":
+            return None
+
+        contacts = value.get("contacts", [{}])
+        display_name = contacts[0].get("profile", {}).get("name", "")
+
+        return WhatsAppMessage(
+            from_number=msg["from"],
+            body=msg["text"]["body"],
+            message_id=msg["id"],
+            display_name=display_name,
+        )
+    except (KeyError, IndexError):
+        return None
 
 
 async def send_text_reply(
-    account_sid: str,
-    auth_token: str,
-    from_number: str,
+    access_token: str,
+    phone_number_id: str,
     to_number: str,
     text: str,
 ) -> None:
-    """Send a WhatsApp text message via Twilio API."""
-    from twilio.rest import Client
+    """Send a WhatsApp text message via Meta Cloud API."""
+    url = f"{GRAPH_API_BASE}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "text",
+        "text": {"body": text},
+    }
+    headers = {"Authorization": f"Bearer {access_token}"}
 
-    try:
-        client = Client(account_sid, auth_token)
-        client.messages.create(
-            from_=f"whatsapp:{from_number}",
-            to=f"whatsapp:{to_number}",
-            body=text,
-        )
-    except Exception as exc:
-        logger.error("Failed to send WhatsApp reply to %s: %s", to_number, exc)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            logger.error(
+                "Failed to send WhatsApp reply to %s: %s %s",
+                to_number, resp.status_code, resp.text,
+            )
+        resp.raise_for_status()

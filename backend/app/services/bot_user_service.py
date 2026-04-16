@@ -1,31 +1,46 @@
 from datetime import datetime, timezone
+from uuid import UUID
 
-from bson import ObjectId
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.mongo import get_db
-from app.models.bot_user import BotUser, Platform
+from app.db.models import BotUser
+from app.schemas.bot_user import Platform
 
 
 async def get_or_create_bot_user(
-    tenant_id: str,
+    db: AsyncSession,
+    tenant_id: str | UUID,
     platform: Platform,
     platform_id: str,
 ) -> BotUser:
     """Upsert a BotUser and update last_seen_at. Returns the BotUser."""
-    db = get_db()
+    tid = UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
     now = datetime.now(timezone.utc)
 
-    result = await db.bot_users.find_one_and_update(
-        {
-            "tenant_id": ObjectId(tenant_id),
-            "platform": platform.value,
-            "platform_id": platform_id,
-        },
-        {"$set": {"last_seen_at": now}, "$setOnInsert": {"created_at": now}},
-        upsert=True,
-        return_document=True,
+    # 1. Try to find existing
+    query = select(BotUser).where(
+        BotUser.tenant_id == tid,
+        BotUser.platform == platform.value,
+        BotUser.platform_id == platform_id,
     )
+    result = await db.execute(query)
+    bot_user = result.scalar_one_or_none()
 
-    result["_id"] = str(result["_id"])
-    result["tenant_id"] = str(result["tenant_id"])
-    return BotUser(**result)
+    if bot_user:
+        # Update last_seen_at
+        bot_user.last_seen_at = now
+    else:
+        # Create new
+        bot_user = BotUser(
+            tenant_id=tid,
+            platform=platform.value,
+            platform_id=platform_id,
+            created_at=now,
+            last_seen_at=now,
+        )
+        db.add(bot_user)
+
+    await db.commit()
+    await db.refresh(bot_user)
+    return bot_user

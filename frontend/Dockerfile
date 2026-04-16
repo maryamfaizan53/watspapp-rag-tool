@@ -7,6 +7,11 @@ COPY package*.json ./
 RUN npm ci --prefer-offline
 
 COPY . .
+
+# Accept VITE_API_URL as build arg so it gets baked into the JS bundle
+ARG VITE_API_URL=""
+ENV VITE_API_URL=$VITE_API_URL
+
 RUN npm run build
 
 # --- runner stage ---

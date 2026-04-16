@@ -1,17 +1,13 @@
 import hashlib
 import io
 import logging
-import textwrap
 from datetime import datetime, timezone
-from typing import Generator
+from uuid import UUID
 
 import pdfplumber
-from bson import ObjectId
 
-from app.db import faiss_store
-from app.db.mongo import get_db
-from app.models.document import DocumentStatus
-from app.models.document_chunk import DocumentChunk
+from app.db import faiss_store, AsyncSessionLocal
+from app.db.models import Document, DocumentChunk
 from app.services.embeddings import embed_batch
 
 logger = logging.getLogger(__name__)
@@ -69,101 +65,86 @@ def chunk_document(file_bytes: bytes, mime_type: str) -> list[dict]:
     return raw_chunks
 
 
-async def process_document(tenant_id: str, document_id: str) -> None:
+async def process_document(tenant_id: str, document_id: str, file_path: str) -> None:
     """
     Full ingestion pipeline: pending → processing → ready (or failed).
     Called as a BackgroundTask after upload.
     """
-    db = get_db()
-    doc_oid = ObjectId(document_id)
+    tid = UUID(tenant_id)
+    did = UUID(document_id)
 
-    # Fetch document record
-    doc = await db.documents.find_one({"_id": doc_oid})
-    if not doc:
-        logger.error("Document %s not found for ingestion", document_id)
-        return
+    async with AsyncSessionLocal() as db:
+        # Fetch document record
+        doc = await db.get(Document, did)
+        if not doc:
+            logger.error("Document %s not found for ingestion", document_id)
+            return
 
-    # Update status → processing
-    await db.documents.update_one(
-        {"_id": doc_oid},
-        {"$set": {"status": DocumentStatus.processing.value}},
-    )
+        # Update status → processing
+        doc.status = "processing"
+        await db.commit()
 
-    try:
-        # Retrieve file bytes from GridFS or temp storage
-        # For Phase 1: file bytes stored temporarily in document record itself
-        file_bytes = doc.get("_file_bytes")
-        if not file_bytes:
-            raise ValueError("File bytes not available for ingestion")
+        try:
+            # Read file bytes from temp storage
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
 
-        mime_type = doc["mime_type"]
-        chunks = chunk_document(file_bytes, mime_type)
+            mime_type = doc.mime_type
+            chunks = chunk_document(file_bytes, mime_type)
 
-        if not chunks:
-            raise ValueError("Document produced zero chunks after parsing")
+            if not chunks:
+                raise ValueError("Document produced zero chunks after parsing")
 
-        # Embed all chunks
-        texts = [c["text"] for c in chunks]
-        vectors = embed_batch(texts)
+            # Embed all chunks
+            texts = [c["text"] for c in chunks]
+            vectors = embed_batch(texts)
 
-        # Add to FAISS + create DocumentChunk records
-        chunk_records = []
-        for i, (chunk_meta, _) in enumerate(zip(chunks, texts)):
-            chunk_records.append(
-                DocumentChunk(
-                    document_id=document_id,
-                    tenant_id=tenant_id,
+            # Add to FAISS and collect assigned faiss_vector_ids
+            # Placeholder IDs for FAISS internal mapping
+            placeholder_ids = [f"{document_id}_{i}" for i in range(len(chunks))]
+            faiss_ids = faiss_store.add_vectors(tenant_id, vectors, placeholder_ids)
+
+            # Create DocumentChunk records
+            for i, (chunk_meta, faiss_id) in enumerate(zip(chunks, faiss_ids)):
+                chunk = DocumentChunk(
+                    document_id=did,
+                    tenant_id=tid,
                     chunk_index=i,
                     text=chunk_meta["text"],
-                    faiss_vector_id=-1,  # will be set after FAISS add
+                    faiss_vector_id=faiss_id,
                     page_number=chunk_meta.get("page_number"),
                 )
+                db.add(chunk)
+            
+            await db.commit()
+
+            # Optional: update FAISS id_map with real DB IDs? 
+            # In PostgreSQL we use UUIDs, let's keep it consistent.
+            # Re-fetch chunks to get their real IDs (though FAISS store used placeholders)
+            # For simplicity, we'll keep the placeholders in FAISS if we search by them, 
+            # but usually we search and get faiss_vector_id, then fetch from DB.
+
+            # Mark document ready
+            doc.status = "ready"
+            doc.chunk_count = len(chunks)
+            doc.ready_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            logger.info(
+                "Ingested document %s for tenant %s: %d chunks", document_id, tenant_id, len(chunks)
             )
 
-        # placeholder chunk_ids for FAISS mapping
-        placeholder_ids = [f"{document_id}_{i}" for i in range(len(chunks))]
-        faiss_ids = faiss_store.add_vectors(tenant_id, vectors, placeholder_ids)
-
-        # Insert DocumentChunk records with real faiss_vector_ids
-        chunk_docs = []
-        for record, faiss_id in zip(chunk_records, faiss_ids):
-            record.faiss_vector_id = faiss_id
-            doc_to_insert = record.to_doc()
-            chunk_docs.append(doc_to_insert)
-
-        result = await db.document_chunks.insert_many(chunk_docs)
-
-        # Update FAISS id_map to use real MongoDB ObjectIds
-        index, id_map = faiss_store.load_index(tenant_id)
-        for faiss_id, inserted_id in zip(faiss_ids, result.inserted_ids):
-            id_map[faiss_id] = str(inserted_id)
-        faiss_store.save_index(tenant_id, index, id_map)
-
-        # Mark document ready
-        await db.documents.update_one(
-            {"_id": doc_oid},
-            {
-                "$set": {
-                    "status": DocumentStatus.ready.value,
-                    "chunk_count": len(chunks),
-                    "ready_at": datetime.now(timezone.utc),
-                    "_file_bytes": None,  # free memory
-                },
-            },
-        )
-        logger.info(
-            "Ingested document %s for tenant %s: %d chunks", document_id, tenant_id, len(chunks)
-        )
-
-    except Exception as exc:
-        logger.exception("Ingestion failed for document %s: %s", document_id, exc)
-        await db.documents.update_one(
-            {"_id": doc_oid},
-            {
-                "$set": {
-                    "status": DocumentStatus.failed.value,
-                    "error_message": str(exc),
-                    "_file_bytes": None,
-                }
-            },
-        )
+        except Exception as exc:
+            logger.exception("Ingestion failed for document %s: %s", document_id, exc)
+            # Rollback and mark failed
+            await db.rollback()
+            doc = await db.get(Document, did) # re-fetch after rollback
+            if doc:
+                doc.status = "failed"
+                doc.error_message = str(exc)
+                await db.commit()
+        finally:
+            # Cleanup temp file
+            import os
+            if os.path.exists(file_path):
+                os.remove(file_path)

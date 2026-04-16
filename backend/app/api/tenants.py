@@ -1,175 +1,269 @@
 import logging
 from datetime import datetime, timezone
+from typing import Optional
+from uuid import UUID
 
-from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_admin
-from app.db import faiss_store
-from app.db.mongo import get_db
-from app.models.admin_user import AdminUser
-from app.models.tenant import ChannelConfig, Tenant, TenantPlan, TenantQuota, TenantStatus
+from app.db import get_db, faiss_store
+from app.db.models import Tenant, AdminUser
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/tenants", tags=["Tenants"])
 
-DEFAULT_QUOTAS = {
-    TenantPlan.starter: TenantQuota(messages_per_month=5_000, rate_limit_per_minute=60),
-    TenantPlan.growth: TenantQuota(messages_per_month=50_000, rate_limit_per_minute=120),
-    TenantPlan.enterprise: TenantQuota(messages_per_month=500_000, rate_limit_per_minute=300),
-}
+
+# ── Schemas ──────────────────────────────────────────────────────────
+
+
+class TenantQuota(BaseModel):
+    messages_per_month: int = 5_000
+    rate_limit_per_minute: int = 60
+
+
+class TenantPlan(str):
+    starter = "starter"
+    growth = "growth"
+    enterprise = "enterprise"
 
 
 class TenantCreateRequest(BaseModel):
     name: str
-    plan: TenantPlan = TenantPlan.starter
-    quota: TenantQuota | None = None
+    plan: str = TenantPlan.starter
+    quota: Optional[TenantQuota] = None
 
 
 class ChannelConfigRequest(BaseModel):
-    telegram_bot_token: str | None = None
-    whatsapp_account_sid: str | None = None
-    whatsapp_auth_token: str | None = None
-    whatsapp_from_number: str | None = None
+    telegram_bot_token: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
+    whatsapp_phone_number_id: Optional[str] = None
+    whatsapp_app_secret: Optional[str] = None
+    whatsapp_verify_token: Optional[str] = None
 
 
-def _serialize(doc: dict) -> dict:
-    doc["id"] = str(doc.pop("_id"))
-    if "tenant_id" in doc:
-        doc["tenant_id"] = str(doc["tenant_id"])
-    # Don't expose raw channel secrets
-    channels = doc.get("channels", {})
+# ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _serialize(tenant: Tenant) -> dict:
+    """Convert tenant model to API response, hiding secrets."""
+    data = {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "plan": tenant.plan,
+        "status": tenant.status,
+        "channels": tenant.channels.copy() if tenant.channels else {},
+        "quota": tenant.quota if tenant.quota else {"messages_per_month": 5000, "rate_limit_per_minute": 60},
+        "usage": tenant.usage if tenant.usage else {"message_count_month": 0, "active_users_month": 0},
+        "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+        "updated_at": tenant.updated_at.isoformat() if tenant.updated_at else None,
+    }
+
+    # Hide raw channel secrets
+    channels = data.get("channels", {})
     if "telegram" in channels:
         channels["telegram"]["configured"] = bool(channels["telegram"].get("bot_token"))
         channels["telegram"].pop("bot_token", None)
         channels["telegram"].pop("webhook_url", None)
     if "whatsapp" in channels:
-        channels["whatsapp"]["configured"] = bool(channels["whatsapp"].get("account_sid"))
-        channels["whatsapp"].pop("account_sid", None)
-        channels["whatsapp"].pop("auth_token", None)
-    return doc
+        channels["whatsapp"]["configured"] = bool(channels["whatsapp"].get("access_token"))
+        channels["whatsapp"].pop("access_token", None)
+        channels["whatsapp"].pop("app_secret", None)
+
+    return data
+
+
+# ── Routes ───────────────────────────────────────────────────────────
 
 
 @router.get("")
 async def list_tenants(
-    status: str | None = None,
+    status: Optional[str] = None,
     page: int = 1,
     limit: int = 20,
+    db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> dict:
-    db = get_db()
-    query: dict = {}
-    if status:
-        query["status"] = status
     skip = (page - 1) * limit
-    total = await db.tenants.count_documents(query)
-    cursor = db.tenants.find(query).skip(skip).limit(limit).sort("created_at", -1)
-    items = await cursor.to_list(length=limit)
+
+    # Build query
+    query = select(Tenant)
+    if status:
+        query = query.where(Tenant.status == status)
+
+    # Get total count
+    count_result = await db.execute(select(func.count()).select_from(Tenant).where(Tenant.status == status if status else True))
+    total = count_result.scalar()
+
+    # Get paginated items
+    query = query.offset(skip).limit(limit).order_by(Tenant.created_at.desc())
+    result = await db.execute(query)
+    items = result.scalars().all()
+
     return {
         "items": [_serialize(t) for t in items],
         "total": total,
         "page": page,
-        "pages": (total + limit - 1) // limit,
+        "pages": (total + limit - 1) // limit if total else 1,
     }
 
 
 @router.post("", status_code=201)
 async def create_tenant(
     body: TenantCreateRequest,
+    db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> dict:
-    db = get_db()
-    existing = await db.tenants.find_one({"name": body.name})
+    # Check existing
+    result = await db.execute(select(Tenant).where(Tenant.name == body.name))
+    existing = result.scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="A tenant with this name already exists.")
 
-    quota = body.quota or DEFAULT_QUOTAS[body.plan]
-    tenant = Tenant(name=body.name, plan=body.plan, quota=quota)
-    result = await db.tenants.insert_one(tenant.to_doc())
-    doc = await db.tenants.find_one({"_id": result.inserted_id})
-    return _serialize(doc)
+    quota = body.quota.dict() if body.quota else {"messages_per_month": 5000, "rate_limit_per_minute": 60}
+
+    tenant = Tenant(
+        name=body.name,
+        plan=body.plan,
+        quota=quota,
+    )
+    db.add(tenant)
+    await db.commit()
+    await db.refresh(tenant)
+
+    return _serialize(tenant)
 
 
 @router.get("/{tenant_id}")
 async def get_tenant(
     tenant_id: str,
+    db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> dict:
-    db = get_db()
-    doc = await db.tenants.find_one({"_id": ObjectId(tenant_id)})
-    if not doc:
+    try:
+        tid = UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    result = await db.execute(select(Tenant).where(Tenant.id == tid))
+    tenant = result.scalar_one_or_none()
+
+    if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    return _serialize(doc)
+
+    return _serialize(tenant)
 
 
 @router.put("/{tenant_id}")
 async def update_tenant(
     tenant_id: str,
     body: TenantCreateRequest,
+    db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> dict:
-    db = get_db()
-    quota = body.quota or DEFAULT_QUOTAS[body.plan]
-    await db.tenants.update_one(
-        {"_id": ObjectId(tenant_id)},
-        {
-            "$set": {
-                "name": body.name,
-                "plan": body.plan.value,
-                "quota": quota.model_dump(),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
-    )
-    doc = await db.tenants.find_one({"_id": ObjectId(tenant_id)})
-    if not doc:
+    try:
+        tid = UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    result = await db.execute(select(Tenant).where(Tenant.id == tid))
+    tenant = result.scalar_one_or_none()
+
+    if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    return _serialize(doc)
+
+    quota = body.quota.dict() if body.quota else {"messages_per_month": 5000, "rate_limit_per_minute": 60}
+
+    tenant.name = body.name
+    tenant.plan = body.plan
+    tenant.quota = quota
+    tenant.updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(tenant)
+
+    return _serialize(tenant)
 
 
 @router.delete("/{tenant_id}", status_code=204)
 async def delete_tenant(
     tenant_id: str,
+    db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> None:
-    db = get_db()
-    tid = ObjectId(tenant_id)
+    try:
+        tid = UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
 
-    # Cascade delete: chunks → documents → messages → conversations → bot_users → tenant
-    await db.document_chunks.delete_many({"tenant_id": tid})
-    await db.documents.delete_many({"tenant_id": tid})
-    await db.messages.delete_many({"tenant_id": tid})
-    await db.conversations.delete_many({"tenant_id": tid})
-    await db.bot_users.delete_many({"tenant_id": tid})
-    await db.usage_snapshots.delete_many({"tenant_id": tid})
-    faiss_store.delete_tenant_index(tenant_id)
+    result = await db.execute(select(Tenant).where(Tenant.id == tid))
+    tenant = result.scalar_one_or_none()
 
-    result = await db.tenants.delete_one({"_id": tid})
-    if result.deleted_count == 0:
+    if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+
+    from sqlalchemy import delete as sql_delete
+    from app.db.models import Document, DocumentChunk, BotUser, Conversation, Message, UsageSnapshot
+
+    # Delete in FK-safe order (children before parents)
+    await db.execute(sql_delete(DocumentChunk).where(DocumentChunk.tenant_id == tid))
+    await db.execute(sql_delete(Document).where(Document.tenant_id == tid))
+    await db.execute(sql_delete(Message).where(Message.tenant_id == tid))
+    await db.execute(sql_delete(Conversation).where(Conversation.tenant_id == tid))
+    await db.execute(sql_delete(BotUser).where(BotUser.tenant_id == tid))
+    await db.execute(sql_delete(UsageSnapshot).where(UsageSnapshot.tenant_id == tid))
+    await db.execute(sql_delete(Tenant).where(Tenant.id == tid))
+    await db.commit()
+
+    faiss_store.delete_tenant_index(tenant_id)
+    logger.info("Deleted tenant %s and all related data", tenant_id)
 
 
 @router.put("/{tenant_id}/channels", status_code=200)
 async def configure_channels(
     tenant_id: str,
     body: ChannelConfigRequest,
+    db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> dict:
-    db = get_db()
-    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    try:
+        tid = UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    result = await db.execute(select(Tenant).where(Tenant.id == tid))
+    tenant = result.scalar_one_or_none()
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Deep copy to force SQLAlchemy to detect the JSON mutation
+    import copy
+    channels = copy.deepcopy(tenant.channels) if tenant.channels else {}
 
     if body.telegram_bot_token is not None:
-        update["channels.telegram.bot_token"] = body.telegram_bot_token
-        update["channels.telegram.configured"] = True
+        channels.setdefault("telegram", {})
+        channels["telegram"]["bot_token"] = body.telegram_bot_token
+        channels["telegram"]["configured"] = True
 
-    if body.whatsapp_account_sid is not None:
-        update["channels.whatsapp.account_sid"] = body.whatsapp_account_sid
-        update["channels.whatsapp.configured"] = True
-    if body.whatsapp_auth_token is not None:
-        update["channels.whatsapp.auth_token"] = body.whatsapp_auth_token
-    if body.whatsapp_from_number is not None:
-        update["channels.whatsapp.from_number"] = body.whatsapp_from_number
+    if body.whatsapp_access_token is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["access_token"] = body.whatsapp_access_token
+        channels["whatsapp"]["configured"] = True
+    if body.whatsapp_phone_number_id is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["phone_number_id"] = body.whatsapp_phone_number_id
+    if body.whatsapp_app_secret is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["app_secret"] = body.whatsapp_app_secret
+    if body.whatsapp_verify_token is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["verify_token"] = body.whatsapp_verify_token
 
-    await db.tenants.update_one({"_id": ObjectId(tenant_id)}, {"$set": update})
+    tenant.channels = channels
+    tenant.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
     return {"ok": True}
