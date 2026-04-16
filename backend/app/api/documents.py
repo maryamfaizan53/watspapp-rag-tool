@@ -186,19 +186,10 @@ async def delete_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete associated chunks
-    await db.execute(
-        select(DocumentChunk).where(DocumentChunk.document_id == did)
-    )
-    chunk_result = await db.execute(
-        select(DocumentChunk).where(DocumentChunk.document_id == did)
-    )
-    chunks = chunk_result.scalars().all()
-    for chunk in chunks:
-        await db.delete(chunk)
-
-    # Delete document
-    await db.delete(doc)
+    # Delete associated chunks first, then document (respects FK constraint)
+    from sqlalchemy import delete as sql_delete
+    await db.execute(sql_delete(DocumentChunk).where(DocumentChunk.document_id == did))
+    await db.execute(sql_delete(Document).where(Document.id == did))
     await db.commit()
 
     # Rebuild FAISS index cache

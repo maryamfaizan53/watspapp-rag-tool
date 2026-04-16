@@ -38,9 +38,10 @@ class TenantCreateRequest(BaseModel):
 
 class ChannelConfigRequest(BaseModel):
     telegram_bot_token: Optional[str] = None
-    whatsapp_account_sid: Optional[str] = None
-    whatsapp_auth_token: Optional[str] = None
-    whatsapp_from_number: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
+    whatsapp_phone_number_id: Optional[str] = None
+    whatsapp_app_secret: Optional[str] = None
+    whatsapp_verify_token: Optional[str] = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -67,9 +68,9 @@ def _serialize(tenant: Tenant) -> dict:
         channels["telegram"].pop("bot_token", None)
         channels["telegram"].pop("webhook_url", None)
     if "whatsapp" in channels:
-        channels["whatsapp"]["configured"] = bool(channels["whatsapp"].get("account_sid"))
-        channels["whatsapp"].pop("account_sid", None)
-        channels["whatsapp"].pop("auth_token", None)
+        channels["whatsapp"]["configured"] = bool(channels["whatsapp"].get("access_token"))
+        channels["whatsapp"].pop("access_token", None)
+        channels["whatsapp"].pop("app_secret", None)
 
     return data
 
@@ -197,18 +198,27 @@ async def delete_tenant(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid tenant ID")
 
-    # TODO: Implement cascade delete for related tables
-    # For now, just delete the tenant and clean up FAISS index
-    faiss_store.delete_tenant_index(tenant_id)
-
     result = await db.execute(select(Tenant).where(Tenant.id == tid))
     tenant = result.scalar_one_or_none()
 
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    await db.delete(tenant)
+    from sqlalchemy import delete as sql_delete
+    from app.db.models import Document, DocumentChunk, BotUser, Conversation, Message, UsageSnapshot
+
+    # Delete in FK-safe order (children before parents)
+    await db.execute(sql_delete(DocumentChunk).where(DocumentChunk.tenant_id == tid))
+    await db.execute(sql_delete(Document).where(Document.tenant_id == tid))
+    await db.execute(sql_delete(Message).where(Message.tenant_id == tid))
+    await db.execute(sql_delete(Conversation).where(Conversation.tenant_id == tid))
+    await db.execute(sql_delete(BotUser).where(BotUser.tenant_id == tid))
+    await db.execute(sql_delete(UsageSnapshot).where(UsageSnapshot.tenant_id == tid))
+    await db.execute(sql_delete(Tenant).where(Tenant.id == tid))
     await db.commit()
+
+    faiss_store.delete_tenant_index(tenant_id)
+    logger.info("Deleted tenant %s and all related data", tenant_id)
 
 
 @router.put("/{tenant_id}/channels", status_code=200)
@@ -229,26 +239,30 @@ async def configure_channels(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Initialize channels if needed
-    if not tenant.channels:
-        tenant.channels = {}
+    # Deep copy to force SQLAlchemy to detect the JSON mutation
+    import copy
+    channels = copy.deepcopy(tenant.channels) if tenant.channels else {}
 
     if body.telegram_bot_token is not None:
-        tenant.channels.setdefault("telegram", {})
-        tenant.channels["telegram"]["bot_token"] = body.telegram_bot_token
-        tenant.channels["telegram"]["configured"] = True
+        channels.setdefault("telegram", {})
+        channels["telegram"]["bot_token"] = body.telegram_bot_token
+        channels["telegram"]["configured"] = True
 
-    if body.whatsapp_account_sid is not None:
-        tenant.channels.setdefault("whatsapp", {})
-        tenant.channels["whatsapp"]["account_sid"] = body.whatsapp_account_sid
-        tenant.channels["whatsapp"]["configured"] = True
-    if body.whatsapp_auth_token is not None:
-        tenant.channels.setdefault("whatsapp", {})
-        tenant.channels["whatsapp"]["auth_token"] = body.whatsapp_auth_token
-    if body.whatsapp_from_number is not None:
-        tenant.channels.setdefault("whatsapp", {})
-        tenant.channels["whatsapp"]["from_number"] = body.whatsapp_from_number
+    if body.whatsapp_access_token is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["access_token"] = body.whatsapp_access_token
+        channels["whatsapp"]["configured"] = True
+    if body.whatsapp_phone_number_id is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["phone_number_id"] = body.whatsapp_phone_number_id
+    if body.whatsapp_app_secret is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["app_secret"] = body.whatsapp_app_secret
+    if body.whatsapp_verify_token is not None:
+        channels.setdefault("whatsapp", {})
+        channels["whatsapp"]["verify_token"] = body.whatsapp_verify_token
 
+    tenant.channels = channels
     tenant.updated_at = datetime.now(timezone.utc)
     await db.commit()
 

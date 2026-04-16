@@ -9,6 +9,7 @@ from app.db import faiss_store
 from app.db.models import Conversation, Message, DocumentChunk
 from app.schemas.conversation import ConversationStatus
 from app.services import embeddings, llm
+from app.services.psx_tools import GEMINI_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -21,14 +22,18 @@ FALLBACK_LLM_DOWN = (
 )
 
 SYSTEM_PROMPT = """You are a helpful PSX (Pakistan Stock Exchange) financial assistant.
-Answer questions ONLY about PSX-listed companies, stock market data, financial reports,
-and related topics. If the question is not about PSX or financial markets, politely
-decline and explain you only cover PSX-related topics.
+Answer questions about PSX-listed companies, stock market data, financial reports, and related topics.
+If the question is not about PSX or financial markets, politely decline.
 
-Use the provided context to answer accurately. If the context does not contain enough
-information, say so honestly rather than guessing.
+You have access to live PSX market data tools. Use them when the user asks about:
+- Current/live/today's stock prices
+- KSE-100 index value
+- Company details (market cap, P/E ratio, 52-week high/low)
+- Finding a stock symbol by company name
 
-Context:
+For questions about general PSX knowledge, regulations, or historical info, use the context below.
+
+Context from knowledge base:
 {context}
 
 Conversation history:
@@ -174,9 +179,9 @@ async def answer_query(
         history_lines.append(f"{role}: {text}")
     history = "\n".join(history_lines) if history_lines else "No prior conversation."
 
-    # 5. Build prompt and call LLM
+    # 5. Build prompt and call LLM with live PSX tools
     prompt = SYSTEM_PROMPT.format(context=context, history=history, question=query_text)
-    answer = await llm.safe_generate(prompt)
+    answer = await llm.safe_generate_with_tools(prompt, GEMINI_TOOLS)
 
     if answer is None:
         return FALLBACK_LLM_DOWN, []
