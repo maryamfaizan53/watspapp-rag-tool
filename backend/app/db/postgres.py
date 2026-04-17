@@ -6,26 +6,25 @@ from urllib.parse import urlparse, urlunparse
 # Parse database URL and handle SSL for asyncpg
 database_url = settings.database_url
 
-# If URL has sslmode parameter, convert it for asyncpg compatibility
-if 'sslmode' in database_url:
-    # Parse the URL
+# Strip params asyncpg doesn't understand (sslmode, channel_binding)
+# and normalise to ssl=require for Neon
+_unsupported = ('sslmode', 'channel_binding')
+if any(p in database_url for p in _unsupported):
     parsed = urlparse(database_url)
-    # Remove sslmode from query
-    query_params = parsed.query.split('&')
-    query_params = [p for p in query_params if not p.startswith('sslmode')]
+    query_params = [
+        p for p in parsed.query.split('&')
+        if p and not any(p.startswith(u) for u in _unsupported)
+    ]
     new_query = '&'.join(query_params)
-    # Rebuild URL without sslmode
     database_url = urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        parsed.path,
-        parsed.params,
-        new_query,
-        parsed.fragment
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, new_query, parsed.fragment,
     ))
-    # Add ssl parameter for asyncpg
-    if 'neon.tech' in database_url:
-        database_url += '?ssl=require'
+
+# Ensure ssl=require is present for Neon
+if 'neon.tech' in database_url and 'ssl=' not in database_url:
+    sep = '&' if '?' in database_url else '?'
+    database_url += f'{sep}ssl=require'
 
 # Create async engine
 engine = create_async_engine(
