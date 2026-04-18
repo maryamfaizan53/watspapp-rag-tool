@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.auth import get_current_admin
 from app.db import get_db, faiss_store
@@ -263,6 +264,7 @@ async def configure_channels(
         channels["whatsapp"]["verify_token"] = body.whatsapp_verify_token
 
     tenant.channels = channels
+    flag_modified(tenant, "channels")
     tenant.updated_at = datetime.now(timezone.utc)
     await db.commit()
 
