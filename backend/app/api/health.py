@@ -53,6 +53,46 @@ async def health_check() -> dict:
     return {"status": overall, "version": "0.1.0", "dependencies": deps}
 
 
+@router.get("/debug/send-test/{tenant_id}/{chat_id}")
+async def debug_send_test(tenant_id: str, chat_id: str) -> dict:
+    """Send a test Telegram reply directly — bypasses background task."""
+    import httpx
+    from app.db.models import Tenant
+    from app.services import embeddings
+    result: dict = {}
+    async with AsyncSessionLocal() as db:
+        tenant = await db.get(Tenant, tenant_id)
+        if not tenant:
+            return {"error": "tenant not found"}
+        bot_token = (tenant.channels or {}).get("telegram", {}).get("bot_token")
+        result["bot_token_present"] = bool(bot_token)
+        if not bot_token:
+            return result
+
+    # Test embed + faiss
+    try:
+        vec = embeddings.embed_text("What is PSX?")
+        hits = faiss_store.search(tenant_id, vec, top_k=3)
+        result["faiss_hits"] = len(hits)
+    except Exception as e:
+        result["faiss_error"] = str(e)
+        return result
+
+    # Send test message via Telegram
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": f"Test OK — FAISS hits: {len(hits)}"},
+            )
+            result["telegram_send"] = resp.status_code
+            result["telegram_response"] = resp.json()
+    except Exception as e:
+        result["telegram_error"] = str(e)
+
+    return result
+
+
 @router.get("/debug/pipeline/{tenant_id}")
 async def debug_pipeline(tenant_id: str) -> dict:
     """Debug endpoint: tests embed + FAISS + channels for a tenant."""
