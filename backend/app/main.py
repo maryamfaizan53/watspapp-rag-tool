@@ -8,10 +8,15 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
+from sqlalchemy import select
+
 from app.api import auth, documents, health, metrics, tenants, webhooks
 from app.config import settings
-from app.db.postgres import close_db, connect_db
+from app.db import faiss_store
+from app.db.models import DocumentChunk, Document
+from app.db.postgres import close_db, connect_db, AsyncSessionLocal
 from app.db.redis import close_redis, connect_redis
+from app.services import embeddings
 from app.services.rate_limiter import limiter
 from app.services.usage_worker import start_worker, stop_worker
 
@@ -22,6 +27,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _rebuild_faiss_indexes() -> None:
+    """Re-embed all ready chunks from DB into FAISS on startup (index is ephemeral in memory)."""
+    logger.info("Rebuilding FAISS indexes from database...")
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(DocumentChunk).join(Document).where(Document.status == "ready")
+            )
+            chunks = result.scalars().all()
+
+        if not chunks:
+            logger.info("No chunks found — FAISS index stays empty.")
+            return
+
+        # Group by tenant
+        from collections import defaultdict
+        import numpy as np
+        by_tenant: dict = defaultdict(list)
+        for chunk in chunks:
+            by_tenant[str(chunk.tenant_id)].append(chunk)
+
+        for tenant_id, tenant_chunks in by_tenant.items():
+            texts = [c.text for c in tenant_chunks]
+            placeholders = [f"{c.document_id}_{c.chunk_index}" for c in tenant_chunks]
+            vectors = np.array([embeddings.embed_text(t) for t in texts], dtype="float32")
+            faiss_store.add_vectors(tenant_id, vectors, placeholders)
+            logger.info("Rebuilt FAISS index for tenant %s: %d chunks", tenant_id, len(texts))
+
+        logger.info("FAISS rebuild complete.")
+    except Exception as exc:
+        logger.exception("FAISS rebuild failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -30,6 +68,7 @@ async def lifespan(app: FastAPI):
     logger.info("Connecting to Redis...")
     await connect_redis()
     start_worker()
+    await _rebuild_faiss_indexes()
     logger.info("Application startup complete")
     yield
     # Shutdown
