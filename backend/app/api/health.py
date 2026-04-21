@@ -137,6 +137,49 @@ async def debug_send_test(tenant_id: str, chat_id: str) -> dict:
     return result
 
 
+@router.get("/debug/telegram-reply/{tenant_id}")
+async def debug_telegram_reply(tenant_id: str, text: str = "What is PSX?") -> dict:
+    """Simulate an inline Telegram webhook message and return what the bot would reply."""
+    import traceback
+    from uuid import UUID
+    from app.services import rag, bot_user_service
+    from app.schemas.bot_user import Platform
+    from app.schemas.message import ContentType, MessageRole
+    result: dict = {"query": text}
+    try:
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import select
+            from app.db.models import Tenant as T
+            tid = UUID(tenant_id)
+            tenant = await db.get(T, tid)
+            if not tenant:
+                return {"error": "tenant not found"}
+            result["tenant_status"] = tenant.status
+
+            bot_user = await bot_user_service.get_or_create_bot_user(
+                db, tid, Platform.telegram, "debug_user"
+            )
+            result["bot_user_id"] = str(bot_user.id)
+
+            conversation = await rag.get_or_create_conversation(
+                db, tid, bot_user.id, Platform.telegram.value
+            )
+            result["conversation_id"] = str(conversation.id)
+
+            answer, chunk_ids = await rag.answer_query(db, tid, conversation.id, text)
+            result["answer"] = answer
+            result["chunk_ids"] = chunk_ids
+            result["webhook_response"] = {
+                "method": "sendMessage",
+                "chat_id": "<user_chat_id>",
+                "text": answer[:200]
+            }
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()[-1000:]
+    return result
+
+
 @router.get("/debug/pipeline/{tenant_id}")
 async def debug_pipeline(tenant_id: str) -> dict:
     """Debug endpoint: tests embed + FAISS + channels for a tenant."""
