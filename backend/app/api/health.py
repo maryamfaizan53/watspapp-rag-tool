@@ -53,6 +53,50 @@ async def health_check() -> dict:
     return {"status": overall, "version": "0.1.0", "dependencies": deps}
 
 
+@router.get("/debug/full-pipeline/{tenant_id}/{chat_id}")
+async def debug_full_pipeline(tenant_id: str, chat_id: str) -> dict:
+    """Run the full RAG pipeline inline and attempt Telegram reply. Returns every step."""
+    import traceback
+    from app.services import rag, llm
+    result: dict = {"steps": []}
+
+    try:
+        async with AsyncSessionLocal() as db:
+            tenant = await db.get(Tenant, tenant_id)
+            if not tenant:
+                return {"error": "tenant not found"}
+            bot_token = (tenant.channels or {}).get("telegram", {}).get("bot_token")
+            result["bot_token"] = "SET" if bot_token else "MISSING"
+            result["channels_raw_keys"] = list((tenant.channels or {}).get("telegram", {}).keys())
+            if not bot_token:
+                return result
+            result["steps"].append("got_bot_token")
+
+            vec = embeddings.embed_text("What is KSE-100?")
+            hits = faiss_store.search(tenant_id, vec, top_k=3)
+            result["faiss_hits"] = len(hits)
+            result["steps"].append("faiss_searched")
+
+            answer = await llm.safe_generate_with_tools(f"User asks: What is KSE-100? Context: PSX is Pakistan Stock Exchange.", [])
+            result["llm_answer"] = (answer or "")[:200]
+            result["steps"].append("llm_answered")
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": int(chat_id), "text": answer or "Test reply"},
+            )
+            result["telegram_status"] = resp.status_code
+            result["telegram_ok"] = resp.json().get("ok")
+            result["steps"].append("telegram_sent")
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()[-500:]
+
+    return result
+
+
 @router.get("/debug/send-test/{tenant_id}/{chat_id}")
 async def debug_send_test(tenant_id: str, chat_id: str) -> dict:
     """Send a test Telegram reply directly — bypasses background task."""
