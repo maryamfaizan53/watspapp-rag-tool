@@ -26,6 +26,9 @@ _MAX_TG_TEXT = 4096
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
+# In-memory tracker for last received WhatsApp webhook (debug only)
+_last_wa_webhook: dict = {}
+
 
 async def _get_tenant(db: AsyncSession, tenant_id: str | UUID) -> Tenant:
     tid = UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
@@ -178,6 +181,19 @@ async def whatsapp_webhook(
             raise HTTPException(status_code=403, detail="Invalid signature")
 
     payload = await request.json()
+
+    # Track last received webhook for debugging
+    global _last_wa_webhook
+    import datetime as _dt
+    _last_wa_webhook = {
+        "received_at": _dt.datetime.utcnow().isoformat(),
+        "tenant_id": tenant_id,
+        "payload_keys": list(payload.keys()),
+        "has_messages": bool(payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages")),
+        "signature_present": bool(signature),
+        "app_secret_set": bool(app_secret),
+    }
+
     background_tasks.add_task(_handle_whatsapp_message, payload, tenant.id)
     return {"ok": True}
 

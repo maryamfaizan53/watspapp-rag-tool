@@ -12,6 +12,15 @@ from app.services import embeddings
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/debug/whatsapp-last-webhook")
+async def debug_whatsapp_last_webhook() -> dict:
+    """Return the last WhatsApp webhook received by this server."""
+    from app.api.webhooks import _last_wa_webhook
+    if not _last_wa_webhook:
+        return {"received": False, "message": "No WhatsApp webhook received since last restart"}
+    return {"received": True, **_last_wa_webhook}
+
+
 @router.get("/debug/whatsapp-simulate/{tenant_id}/{from_number}")
 async def debug_whatsapp_simulate(tenant_id: str, from_number: str, text: str = "What is PSX?") -> dict:
     """Simulate an incoming WhatsApp message and send a real reply."""
