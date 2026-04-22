@@ -14,11 +14,21 @@ router = APIRouter(tags=["Health"])
 
 @router.get("/debug/whatsapp-last-webhook")
 async def debug_whatsapp_last_webhook() -> dict:
-    """Return the last WhatsApp webhook received by this server."""
+    """Return the last WhatsApp webhook received (persisted in Redis)."""
+    import json as _json
     from app.api.webhooks import _last_wa_webhook
-    if not _last_wa_webhook:
-        return {"received": False, "message": "No WhatsApp webhook received since last restart"}
-    return {"received": True, **_last_wa_webhook}
+    # Try Redis first (survives restarts)
+    try:
+        val = await get_redis().get("debug:last_wa_webhook")
+        if val:
+            data = _json.loads(val)
+            return {"received": True, "source": "redis", **data}
+    except Exception:
+        pass
+    # Fall back to in-memory
+    if _last_wa_webhook:
+        return {"received": True, "source": "memory", **_last_wa_webhook}
+    return {"received": False, "message": "No WhatsApp webhook received since last restart"}
 
 
 @router.get("/debug/whatsapp-simulate/{tenant_id}/{from_number}")

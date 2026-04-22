@@ -182,9 +182,9 @@ async def whatsapp_webhook(
 
     payload = await request.json()
 
-    # Track last received webhook for debugging
+    # Track last received webhook in Redis (persists across restarts)
+    import datetime as _dt, json as _json
     global _last_wa_webhook
-    import datetime as _dt
     _last_wa_webhook = {
         "received_at": _dt.datetime.utcnow().isoformat(),
         "tenant_id": tenant_id,
@@ -193,6 +193,11 @@ async def whatsapp_webhook(
         "signature_present": bool(signature),
         "app_secret_set": bool(app_secret),
     }
+    try:
+        from app.db.redis import get_redis
+        await get_redis().set("debug:last_wa_webhook", _json.dumps(_last_wa_webhook), ex=3600)
+    except Exception:
+        pass
 
     background_tasks.add_task(_handle_whatsapp_message, payload, tenant.id)
     return {"ok": True}
