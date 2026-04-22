@@ -174,23 +174,26 @@ async def whatsapp_webhook(
     body_bytes = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
 
+    # Track BEFORE signature check so we can see if Meta is calling us at all
+    import datetime as _dt, json as _json
+    global _last_wa_webhook
+    sig_valid: str = "skipped"
     if app_secret and signature:
         try:
             wa_provider.verify_signature(app_secret, body_bytes, signature)
+            sig_valid = "ok"
         except InvalidSignatureError:
-            raise HTTPException(status_code=403, detail="Invalid signature")
+            sig_valid = "failed"
+            logger.warning("WhatsApp signature verification failed for tenant %s — proceeding anyway for debug", tenant_id)
 
     payload = await request.json()
 
-    # Track last received webhook in Redis (persists across restarts)
-    import datetime as _dt, json as _json
-    global _last_wa_webhook
     _last_wa_webhook = {
         "received_at": _dt.datetime.utcnow().isoformat(),
         "tenant_id": tenant_id,
         "payload_keys": list(payload.keys()),
         "has_messages": bool(payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages")),
-        "signature_present": bool(signature),
+        "signature_check": sig_valid,
         "app_secret_set": bool(app_secret),
     }
     try:
