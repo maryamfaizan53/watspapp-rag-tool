@@ -12,6 +12,47 @@ from app.services import embeddings
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/debug/whatsapp-simulate/{tenant_id}/{from_number}")
+async def debug_whatsapp_simulate(tenant_id: str, from_number: str, text: str = "What is PSX?") -> dict:
+    """Simulate an incoming WhatsApp message and send a real reply."""
+    import traceback
+    from uuid import UUID
+    from app.services import rag, bot_user_service
+    from app.schemas.bot_user import Platform
+    from app.schemas.message import ContentType, MessageRole
+    from app.providers import whatsapp as wa
+    result: dict = {"from": from_number, "query": text}
+    try:
+        async with AsyncSessionLocal() as db:
+            from app.db.models import Tenant as T
+            tenant = await db.get(T, UUID(tenant_id))
+            if not tenant:
+                return {"error": "tenant not found"}
+            wa_cfg = (tenant.channels or {}).get("whatsapp", {})
+            access_token = wa_cfg.get("access_token")
+            phone_number_id = wa_cfg.get("phone_number_id")
+            result["credentials_ok"] = bool(access_token and phone_number_id)
+            if not access_token or not phone_number_id:
+                return result
+
+            bot_user = await bot_user_service.get_or_create_bot_user(
+                db, UUID(tenant_id), Platform.whatsapp, from_number
+            )
+            conversation = await rag.get_or_create_conversation(
+                db, UUID(tenant_id), bot_user.id, Platform.whatsapp.value
+            )
+            answer, chunk_ids = await rag.answer_query(db, UUID(tenant_id), conversation.id, text)
+            result["answer"] = answer[:300]
+            result["faiss_hits"] = len(chunk_ids)
+
+            await wa.send_text_reply(access_token, phone_number_id, from_number, answer)
+            result["sent"] = True
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()[-800:]
+    return result
+
+
 @router.get("/debug/whatsapp-send/{tenant_id}/{to_number}")
 async def debug_whatsapp_send(tenant_id: str, to_number: str) -> dict:
     """Test WhatsApp send directly — bypasses webhook, sends a real message."""
