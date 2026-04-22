@@ -65,9 +65,12 @@ def parse_webhook(payload: dict) -> Optional[WhatsAppMessage]:
 
 
 def _send_whatsapp_sync(access_token: str, phone_number_id: str, to_number: str, text: str) -> None:
-    """Synchronous WhatsApp send — runs in thread executor to avoid httpx timeout issues."""
+    """Synchronous WhatsApp send with retries — runs in thread executor."""
     import urllib.request
+    import urllib.error
     import json as _json
+    import time as _time
+
     url = f"{GRAPH_API_BASE}/{phone_number_id}/messages"
     payload = {
         "messaging_product": "whatsapp",
@@ -77,15 +80,29 @@ def _send_whatsapp_sync(access_token: str, phone_number_id: str, to_number: str,
         "text": {"body": text},
     }
     data = _json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        if resp.status != 200:
-            body = resp.read().decode()
-            logger.error("Failed to send WhatsApp reply to %s: %s %s", to_number, resp.status, body)
+
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(3):
+        if attempt > 0:
+            _time.sleep(2 * attempt)
+        try:
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode()
+                if resp.status != 200:
+                    logger.error("WhatsApp send error %s: %s", resp.status, body)
+                else:
+                    logger.info("WhatsApp message sent to %s (attempt %d)", to_number, attempt + 1)
+                    return
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("WhatsApp send attempt %d failed: %s", attempt + 1, exc)
+
+    raise last_exc
 
 
 async def send_text_reply(
@@ -97,28 +114,8 @@ async def send_text_reply(
     """Send a WhatsApp text message via Meta Cloud API."""
     import asyncio
     import functools
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            functools.partial(_send_whatsapp_sync, access_token, phone_number_id, to_number, text),
-        )
-        return
-    except Exception as exc:
-        logger.warning("sync WhatsApp send failed, trying httpx: %s", exc)
-
-    # Fallback: httpx with longer timeout
-    url = f"{GRAPH_API_BASE}/{phone_number_id}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to_number,
-        "type": "text",
-        "text": {"body": text},
-    }
-    headers = {"Authorization": f"Bearer {access_token}"}
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        if resp.status_code != 200:
-            logger.error("Failed to send WhatsApp reply to %s: %s %s", to_number, resp.status_code, resp.text)
-        resp.raise_for_status()
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        functools.partial(_send_whatsapp_sync, access_token, phone_number_id, to_number, text),
+    )
