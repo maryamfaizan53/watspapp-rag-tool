@@ -64,6 +64,30 @@ def parse_webhook(payload: dict) -> Optional[WhatsAppMessage]:
         return None
 
 
+def _send_whatsapp_sync(access_token: str, phone_number_id: str, to_number: str, text: str) -> None:
+    """Synchronous WhatsApp send — runs in thread executor to avoid httpx timeout issues."""
+    import urllib.request
+    import json as _json
+    url = f"{GRAPH_API_BASE}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "text",
+        "text": {"body": text},
+    }
+    data = _json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        if resp.status != 200:
+            body = resp.read().decode()
+            logger.error("Failed to send WhatsApp reply to %s: %s %s", to_number, resp.status, body)
+
+
 async def send_text_reply(
     access_token: str,
     phone_number_id: str,
@@ -71,6 +95,19 @@ async def send_text_reply(
     text: str,
 ) -> None:
     """Send a WhatsApp text message via Meta Cloud API."""
+    import asyncio
+    import functools
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            functools.partial(_send_whatsapp_sync, access_token, phone_number_id, to_number, text),
+        )
+        return
+    except Exception as exc:
+        logger.warning("sync WhatsApp send failed, trying httpx: %s", exc)
+
+    # Fallback: httpx with longer timeout
     url = f"{GRAPH_API_BASE}/{phone_number_id}/messages"
     payload = {
         "messaging_product": "whatsapp",
@@ -80,12 +117,8 @@ async def send_text_reply(
         "text": {"body": text},
     }
     headers = {"Authorization": f"Bearer {access_token}"}
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=45.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code != 200:
-            logger.error(
-                "Failed to send WhatsApp reply to %s: %s %s",
-                to_number, resp.status_code, resp.text,
-            )
+            logger.error("Failed to send WhatsApp reply to %s: %s %s", to_number, resp.status_code, resp.text)
         resp.raise_for_status()
