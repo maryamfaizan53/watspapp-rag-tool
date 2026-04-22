@@ -30,38 +30,22 @@ async def _generate_ollama(prompt: str) -> str:
         return response.json().get("response", "").strip()
 
 
-def _gemini_post_sync(url: str, payload: dict) -> dict:
-    """Synchronous Gemini POST via urllib — avoids httpx timeout issues on HF Spaces."""
-    import ssl, urllib.request, json as _json
-    data = _json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
-        return _json.loads(resp.read().decode())
-
-
 async def _generate_gemini(prompt: str) -> str:
     """Send a plain prompt to Google Gemini API (no tools)."""
     if not settings.gemini_api_key:
         raise ValueError("GEMINI_API_KEY is not set")
 
-    import asyncio, functools
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, functools.partial(_gemini_post_sync, url, payload))
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError) as e:
-        logger.error("Unexpected Gemini response structure: %s", data)
-        raise ValueError("Invalid response from Gemini API") from e
+    async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError) as e:
+            logger.error("Unexpected Gemini response structure: %s", data)
+            raise ValueError("Invalid response from Gemini API") from e
 
 
 async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
@@ -74,49 +58,42 @@ async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
 
     from app.services.psx_tools import TOOL_FUNCTIONS
 
-    import asyncio, functools
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
-
     contents = [{"role": "user", "parts": [{"text": prompt}]}]
     payload = {"contents": contents, "tools": tools}
-    loop = asyncio.get_event_loop()
 
-    for _ in range(5):  # max 5 tool call rounds
-        data = await loop.run_in_executor(None, functools.partial(_gemini_post_sync, url, payload))
+    async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+        for _ in range(5):
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            candidate = data["candidates"][0]["content"]
+            parts = candidate.get("parts", [])
+            text_parts = [p["text"] for p in parts if "text" in p]
+            func_calls = [p["functionCall"] for p in parts if "functionCall" in p]
 
-        candidate = data["candidates"][0]["content"]
-        parts = candidate.get("parts", [])
+            if not func_calls:
+                return " ".join(text_parts).strip()
 
-        text_parts = [p["text"] for p in parts if "text" in p]
-        func_calls = [p["functionCall"] for p in parts if "functionCall" in p]
+            function_response_parts = []
+            for fc in func_calls:
+                func_name = fc["name"]
+                func_args = fc.get("args", {})
+                logger.info("Calling PSX tool: %s(%s)", func_name, func_args)
+                tool_fn = TOOL_FUNCTIONS.get(func_name)
+                if tool_fn:
+                    import inspect
+                    result = await tool_fn(**func_args) if inspect.iscoroutinefunction(tool_fn) else tool_fn(**func_args)
+                else:
+                    result = {"error": f"Unknown tool: {func_name}"}
+                logger.info("Tool result: %s", result)
+                function_response_parts.append({
+                    "functionResponse": {"name": func_name, "response": {"result": result}}
+                })
 
-        if not func_calls:
-            return " ".join(text_parts).strip()
-
-        function_response_parts = []
-        for fc in func_calls:
-            func_name = fc["name"]
-            func_args = fc.get("args", {})
-            logger.info("Calling PSX tool: %s(%s)", func_name, func_args)
-
-            tool_fn = TOOL_FUNCTIONS.get(func_name)
-            if tool_fn:
-                import inspect
-                result = await tool_fn(**func_args) if inspect.iscoroutinefunction(tool_fn) else tool_fn(**func_args)
-            else:
-                result = {"error": f"Unknown tool: {func_name}"}
-            logger.info("Tool result: %s", result)
-
-            function_response_parts.append({
-                "functionResponse": {
-                    "name": func_name,
-                    "response": {"result": result},
-                }
-            })
-
-        contents.append({"role": "model", "parts": parts})
-        contents.append({"role": "user", "parts": function_response_parts})
-        payload["contents"] = contents
+            contents.append({"role": "model", "parts": parts})
+            contents.append({"role": "user", "parts": function_response_parts})
+            payload["contents"] = contents
 
     return "I was unable to complete the request. Please try again."
 
