@@ -25,7 +25,9 @@ async def main() -> None:
         existing = result.scalar_one_or_none()
 
         if existing:
-            print(f"Admin user '{email}' already exists — skipping.")
+            existing.hashed_password = hash_password(settings.seed_admin_password)
+            await db.commit()
+            print(f"Updated password for admin user '{email}'.")
             await close_db()
             return
 
