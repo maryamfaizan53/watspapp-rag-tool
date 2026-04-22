@@ -138,7 +138,25 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
             tenant.usage = new_usage
             await db.commit()
 
+            import json as _json
+            try:
+                from app.db.redis import get_redis
+                await get_redis().set("debug:wa_pre_send", _json.dumps({
+                    "from_number": msg.from_number,
+                    "phone_number_id": phone_number_id,
+                    "answer_preview": answer[:100],
+                    "access_token_prefix": access_token[:12] + "...",
+                }), ex=3600)
+            except Exception:
+                pass
+
             await wa_provider.send_text_reply(access_token, phone_number_id, msg.from_number, answer)
+
+            try:
+                from app.db.redis import get_redis
+                await get_redis().set("debug:wa_send_ok", _json.dumps({"to": msg.from_number, "sent": True}), ex=3600)
+            except Exception:
+                pass
 
         except Exception as exc:
             import traceback as _tb, json as _json

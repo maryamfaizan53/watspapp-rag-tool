@@ -12,6 +12,21 @@ from app.services import embeddings
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/debug/whatsapp-send-trace")
+async def debug_whatsapp_send_trace() -> dict:
+    """Show pre-send and post-send state from last WhatsApp background task."""
+    import json as _json
+    result = {}
+    try:
+        pre = await get_redis().get("debug:wa_pre_send")
+        ok = await get_redis().get("debug:wa_send_ok")
+        result["pre_send"] = _json.loads(pre) if pre else None
+        result["send_ok"] = _json.loads(ok) if ok else None
+    except Exception as e:
+        result["redis_error"] = str(e)
+    return result
+
+
 @router.get("/debug/whatsapp-parse-trace")
 async def debug_whatsapp_parse_trace() -> dict:
     """Return trace of last time parse_webhook returned None."""
