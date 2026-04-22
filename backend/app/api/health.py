@@ -12,6 +12,19 @@ from app.services import embeddings
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/debug/whatsapp-parse-trace")
+async def debug_whatsapp_parse_trace() -> dict:
+    """Return trace of last time parse_webhook returned None."""
+    import json as _json
+    try:
+        val = await get_redis().get("debug:wa_parse_none")
+        if val:
+            return {"parse_returned_none": True, **_json.loads(val)}
+    except Exception as e:
+        return {"redis_error": str(e)}
+    return {"parse_returned_none": False, "message": "parse_webhook did not return None"}
+
+
 @router.get("/debug/whatsapp-last-error")
 async def debug_whatsapp_last_error() -> dict:
     """Return the last error from the WhatsApp background task."""

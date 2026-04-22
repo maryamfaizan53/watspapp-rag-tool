@@ -93,6 +93,17 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
 
         msg = wa_provider.parse_webhook(payload)
         if not msg or not msg.body.strip():
+            import json as _json
+            try:
+                from app.db.redis import get_redis
+                await get_redis().set("debug:wa_parse_none", _json.dumps({
+                    "payload_entry_keys": list((payload.get("entry", [{}])[0]).keys()),
+                    "changes": str(payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", "NO_MESSAGES"))[:300],
+                    "msg_was_none": msg is None,
+                    "body_empty": bool(msg) and not msg.body.strip(),
+                }), ex=3600)
+            except Exception:
+                pass
             return
 
         try:
