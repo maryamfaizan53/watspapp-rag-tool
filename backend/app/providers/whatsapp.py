@@ -86,12 +86,16 @@ def _send_whatsapp_sync(access_token: str, phone_number_id: str, to_number: str,
         if attempt > 0:
             _time.sleep(2 * attempt)
         try:
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
             req = urllib.request.Request(
                 url, data=data,
                 headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
                 body = resp.read().decode()
                 if resp.status != 200:
                     logger.error("WhatsApp send error %s: %s", resp.status, body)

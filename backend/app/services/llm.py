@@ -32,15 +32,17 @@ async def _generate_ollama(prompt: str) -> str:
 
 def _gemini_post_sync(url: str, payload: dict) -> dict:
     """Synchronous Gemini POST via urllib — avoids httpx timeout issues on HF Spaces."""
-    import urllib.request
-    import json as _json
+    import ssl, urllib.request, json as _json
     data = _json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
         return _json.loads(resp.read().decode())
 
 
