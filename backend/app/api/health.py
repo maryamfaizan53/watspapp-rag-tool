@@ -12,6 +12,38 @@ from app.services import embeddings
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/debug/whatsapp-send/{tenant_id}/{to_number}")
+async def debug_whatsapp_send(tenant_id: str, to_number: str) -> dict:
+    """Test WhatsApp send directly — bypasses webhook, sends a real message."""
+    import traceback
+    from uuid import UUID
+    from app.providers import whatsapp as wa
+    result: dict = {}
+    try:
+        async with AsyncSessionLocal() as db:
+            from app.db.models import Tenant as T
+            tenant = await db.get(T, UUID(tenant_id))
+            if not tenant:
+                return {"error": "tenant not found"}
+            wa_cfg = (tenant.channels or {}).get("whatsapp", {})
+            result["access_token_set"] = bool(wa_cfg.get("access_token"))
+            result["phone_number_id_set"] = bool(wa_cfg.get("phone_number_id"))
+            result["phone_number_id"] = wa_cfg.get("phone_number_id", "MISSING")
+            if not wa_cfg.get("access_token") or not wa_cfg.get("phone_number_id"):
+                return result
+            await wa.send_text_reply(
+                wa_cfg["access_token"],
+                wa_cfg["phone_number_id"],
+                to_number,
+                "✅ Test message from BotIQ — WhatsApp channel is working!",
+            )
+            result["sent"] = True
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()[-800:]
+    return result
+
+
 @router.get("/health")
 async def health_check() -> dict:
     deps: dict[str, str] = {}
