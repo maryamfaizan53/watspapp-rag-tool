@@ -12,6 +12,19 @@ from app.services import embeddings
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/debug/whatsapp-last-error")
+async def debug_whatsapp_last_error() -> dict:
+    """Return the last error from the WhatsApp background task."""
+    import json as _json
+    try:
+        val = await get_redis().get("debug:last_wa_error")
+        if val:
+            return {"has_error": True, **_json.loads(val)}
+    except Exception as e:
+        return {"redis_error": str(e)}
+    return {"has_error": False, "message": "No errors recorded"}
+
+
 @router.get("/debug/whatsapp-last-webhook")
 async def debug_whatsapp_last_webhook() -> dict:
     """Return the last WhatsApp webhook received (persisted in Redis)."""

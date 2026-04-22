@@ -130,7 +130,14 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
             await wa_provider.send_text_reply(access_token, phone_number_id, msg.from_number, answer)
 
         except Exception as exc:
+            import traceback as _tb, json as _json
             logger.exception("Unhandled error in WhatsApp handler for tenant %s: %s", tenant_id, exc)
+            err_data = {"error": str(exc), "traceback": _tb.format_exc()[-1000:]}
+            try:
+                from app.db.redis import get_redis
+                await get_redis().set("debug:last_wa_error", _json.dumps(err_data), ex=3600)
+            except Exception:
+                pass
             try:
                 await wa_provider.send_text_reply(
                     access_token, phone_number_id, msg.from_number,
