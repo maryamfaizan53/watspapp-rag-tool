@@ -14,14 +14,16 @@ router = APIRouter(tags=["Health"])
 
 @router.get("/debug/whatsapp-send-trace")
 async def debug_whatsapp_send_trace() -> dict:
-    """Show pre-send and post-send state from last WhatsApp background task."""
+    """Show pre-send, post-send, and send-error state from last WhatsApp background task."""
     import json as _json
     result = {}
     try:
         pre = await get_redis().get("debug:wa_pre_send")
         ok = await get_redis().get("debug:wa_send_ok")
+        err = await get_redis().get("debug:wa_send_error")
         result["pre_send"] = _json.loads(pre) if pre else None
         result["send_ok"] = _json.loads(ok) if ok else None
+        result["send_error"] = _json.loads(err) if err else None
     except Exception as e:
         result["redis_error"] = str(e)
     return result

@@ -139,24 +139,29 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
             await db.commit()
 
             import json as _json
-            try:
-                from app.db.redis import get_redis
-                await get_redis().set("debug:wa_pre_send", _json.dumps({
-                    "from_number": msg.from_number,
-                    "phone_number_id": phone_number_id,
-                    "answer_preview": answer[:100],
-                    "access_token_prefix": access_token[:12] + "...",
-                }), ex=3600)
-            except Exception:
-                pass
+            from app.db.redis import get_redis
+            await get_redis().set("debug:wa_pre_send", _json.dumps({
+                "from_number": msg.from_number,
+                "phone_number_id": phone_number_id,
+                "answer_preview": answer[:100],
+                "access_token_prefix": access_token[:12] + "...",
+            }), ex=3600)
 
-            await wa_provider.send_text_reply(access_token, phone_number_id, msg.from_number, answer)
-
+            # Isolated send with its own error capture
             try:
-                from app.db.redis import get_redis
+                await wa_provider.send_text_reply(access_token, phone_number_id, msg.from_number, answer)
                 await get_redis().set("debug:wa_send_ok", _json.dumps({"to": msg.from_number, "sent": True}), ex=3600)
-            except Exception:
-                pass
+                await get_redis().delete("debug:wa_send_error")
+            except Exception as send_exc:
+                import traceback as _tb
+                logger.exception("WhatsApp send failed for tenant %s: %s", tenant_id, send_exc)
+                await get_redis().set("debug:wa_send_error", _json.dumps({
+                    "error": str(send_exc),
+                    "type": type(send_exc).__name__,
+                    "traceback": _tb.format_exc()[-1000:],
+                    "phone_number_id": phone_number_id,
+                    "to": msg.from_number,
+                }), ex=3600)
 
         except Exception as exc:
             import traceback as _tb, json as _json
@@ -165,13 +170,6 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
             try:
                 from app.db.redis import get_redis
                 await get_redis().set("debug:last_wa_error", _json.dumps(err_data), ex=3600)
-            except Exception:
-                pass
-            try:
-                await wa_provider.send_text_reply(
-                    access_token, phone_number_id, msg.from_number,
-                    "An unexpected error occurred. Please try again.",
-                )
             except Exception:
                 pass
 
