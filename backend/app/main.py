@@ -69,6 +69,9 @@ async def lifespan(app: FastAPI):
     await connect_redis()
     start_worker()
     await _rebuild_faiss_indexes()
+    # Ensure circuit breaker starts closed on every deploy
+    from app.services.llm import _breaker
+    _breaker.close()
     logger.info("Application startup complete")
     yield
     # Shutdown
