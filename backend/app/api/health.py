@@ -40,6 +40,29 @@ async def debug_whatsapp_parse_trace() -> dict:
     return {"parse_returned_none": False, "message": "parse_webhook did not return None"}
 
 
+@router.get("/debug/reset-breaker")
+async def reset_circuit_breaker() -> dict:
+    """Reset the LLM circuit breaker to CLOSED state."""
+    from app.services.llm import _breaker
+    try:
+        _breaker.close()
+        return {"status": "reset", "state": str(_breaker.current_state)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@router.get("/debug/test-gemini")
+async def test_gemini_direct() -> dict:
+    """Test Gemini API directly — bypasses circuit breaker."""
+    import traceback
+    from app.services.llm import _generate_gemini
+    try:
+        answer = await _generate_gemini("Say hello in one sentence.")
+        return {"ok": True, "answer": answer}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()[-600:]}
+
+
 @router.get("/debug/whatsapp-last-error")
 async def debug_whatsapp_last_error() -> dict:
     """Return the last error from the WhatsApp background task."""
