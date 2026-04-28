@@ -16,7 +16,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     listTenants({ status: "active" })
-      .then((r) => setTenants(r.items))
+      .then((r) => setTenants(r?.items ?? r ?? []))
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
