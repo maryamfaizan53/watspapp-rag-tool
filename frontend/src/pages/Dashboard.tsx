@@ -16,7 +16,10 @@ export default function Dashboard() {
 
   useEffect(() => {
     listTenants({ status: "active" })
-      .then((r) => setTenants(r?.items ?? r ?? []))
+      .then((r) => {
+        const items = r?.items ?? r;
+        setTenants(Array.isArray(items) ? items : []);
+      })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -26,7 +29,7 @@ export default function Dashboard() {
     window.location.href = "/login";
   }
 
-  const totalMessages = tenants.reduce((s, t) => s + (t.usage?.message_count_month || 0), 0);
+  const totalMessages = Array.isArray(tenants) ? tenants.reduce((s, t) => s + (t.usage?.message_count_month || 0), 0) : 0;
 
   const greeting = () => {
     const h = new Date().getHours();
