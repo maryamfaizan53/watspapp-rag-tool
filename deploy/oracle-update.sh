@@ -14,7 +14,7 @@ docker compose -f docker-compose.oracle.yml --env-file .env.prod up -d --build
 
 echo "Waiting for health check..."
 sleep 15
-docker compose -f docker-compose.oracle.yml ps
+docker compose -f docker-compose.oracle.yml --env-file .env.prod ps
 
 echo ""
 echo "Done. Backend health:"

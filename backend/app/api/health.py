@@ -65,6 +65,18 @@ async def test_gemini_direct() -> dict:
         return {"ok": False, "error": str(e), "traceback": traceback.format_exc()[-600:]}
 
 
+@router.get("/debug/test-openai")
+async def test_openai_direct() -> dict:
+    """Test OpenAI API directly — bypasses circuit breaker."""
+    import traceback
+    from app.services.llm import _generate_openai
+    try:
+        answer = await _generate_openai("Say hello in one sentence.")
+        return {"ok": True, "answer": answer}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()[-600:]}
+
+
 @router.get("/debug/whatsapp-last-error")
 async def debug_whatsapp_last_error() -> dict:
     """Return the last error from the WhatsApp background task."""

@@ -48,6 +48,26 @@ async def _generate_gemini(prompt: str) -> str:
             raise ValueError("Invalid response from Gemini API") from e
 
 
+async def _generate_openai(prompt: str) -> str:
+    """Send a plain prompt to OpenAI Chat Completions API."""
+    if not settings.openai_api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1024,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+
+
 async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
     """
     Send a prompt to Gemini with function calling tools.
@@ -107,6 +127,8 @@ async def generate(prompt: str) -> str:
             return await _generate_ollama(prompt)
         elif provider == "gemini":
             return await _generate_gemini(prompt)
+        elif provider == "openai":
+            return await _generate_openai(prompt)
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
     except httpx.TimeoutException as exc:
@@ -122,13 +144,14 @@ async def generate(prompt: str) -> str:
 
 @_breaker
 async def generate_with_tools(prompt: str, tools: list) -> str:
-    """Send a prompt with tool support (Gemini only). Falls back to plain generate for Ollama."""
+    """Send a prompt with tool support (Gemini only). Falls back to plain generate for others."""
     provider = settings.llm_provider.lower()
     try:
         if provider == "gemini":
             return await _generate_gemini_with_tools(prompt, tools)
+        elif provider == "openai":
+            return await _generate_openai(prompt)
         else:
-            # Ollama doesn't support function calling — plain generate
             return await _generate_ollama(prompt)
     except httpx.TimeoutException as exc:
         logger.warning("%s tool request timed out: %s", provider, exc)
@@ -141,12 +164,31 @@ async def generate_with_tools(prompt: str, tools: list) -> str:
         raise
 
 
+async def _openai_fallback(prompt: str) -> str | None:
+    """Try OpenAI as fallback — returns None if key missing or call fails."""
+    if not settings.openai_api_key:
+        return None
+    try:
+        result = await _generate_openai(prompt)
+        logger.info("OpenAI fallback succeeded")
+        return result
+    except Exception as exc:
+        logger.error("OpenAI fallback failed: %s", exc)
+        return None
+
+
 async def safe_generate(prompt: str) -> str | None:
-    """Generate a response, returning None if unavailable."""
+    """Generate a response; falls back to OpenAI on Gemini 429 or circuit breaker open."""
     try:
         return await generate(prompt)
     except pybreaker.CircuitBreakerError:
-        logger.warning("LLM circuit breaker is OPEN — returning None")
+        logger.warning("LLM circuit breaker OPEN — trying OpenAI fallback")
+        return await _openai_fallback(prompt)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            logger.warning("LLM rate limited (429) — trying OpenAI fallback")
+            return await _openai_fallback(prompt)
+        logger.error("LLM generation failed: %s", exc)
         return None
     except Exception as exc:
         logger.error("LLM generation failed: %s", exc)
@@ -154,11 +196,17 @@ async def safe_generate(prompt: str) -> str | None:
 
 
 async def safe_generate_with_tools(prompt: str, tools: list) -> str | None:
-    """Generate a response with tools, returning None if unavailable."""
+    """Generate with tools; falls back to OpenAI plain generate on 429 or breaker open."""
     try:
         return await generate_with_tools(prompt, tools)
     except pybreaker.CircuitBreakerError:
-        logger.warning("LLM circuit breaker is OPEN — returning None")
+        logger.warning("LLM circuit breaker OPEN — trying OpenAI fallback")
+        return await _openai_fallback(prompt)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            logger.warning("LLM rate limited (429) — trying OpenAI fallback")
+            return await _openai_fallback(prompt)
+        logger.error("LLM tool generation failed: %s", exc)
         return None
     except Exception as exc:
         logger.error("LLM tool generation failed: %s", exc)
