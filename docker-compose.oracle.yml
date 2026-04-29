@@ -84,9 +84,8 @@ services:
       - "443:443"
     volumes:
       - ./nginx/oracle.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
-      - certbot_www:/var/www/certbot:ro
-      - certbot_certs:/etc/letsencrypt:ro
+      - ./certbot/certs:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
     depends_on:
       - backend
       - frontend
@@ -96,5 +95,3 @@ volumes:
   redis_data:
   fastembed_cache:
   hf_cache:
-  certbot_www:
-  certbot_certs:
