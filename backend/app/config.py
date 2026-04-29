@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
 
-    # LLM Provider (ollama, gemini)
+    # LLM Provider (ollama, gemini, openai)
     llm_provider: str = "gemini"
 
     # Ollama

@@ -164,30 +164,44 @@ async def generate_with_tools(prompt: str, tools: list) -> str:
         raise
 
 
-async def _openai_fallback(prompt: str) -> str | None:
-    """Try OpenAI as fallback — returns None if key missing or call fails."""
-    if not settings.openai_api_key:
-        return None
-    try:
-        result = await _generate_openai(prompt)
-        logger.info("OpenAI fallback succeeded")
-        return result
-    except Exception as exc:
-        logger.error("OpenAI fallback failed: %s", exc)
-        return None
+async def _get_fallback(prompt: str) -> str | None:
+    """Return a response from the fallback provider (opposite of the primary)."""
+    provider = settings.llm_provider.lower()
+    if provider == "openai":
+        # Primary is OpenAI → fall back to Gemini
+        if not settings.gemini_api_key:
+            return None
+        try:
+            result = await _generate_gemini(prompt)
+            logger.info("Gemini fallback succeeded")
+            return result
+        except Exception as exc:
+            logger.error("Gemini fallback failed: %s", exc)
+            return None
+    else:
+        # Primary is Gemini/Ollama → fall back to OpenAI
+        if not settings.openai_api_key:
+            return None
+        try:
+            result = await _generate_openai(prompt)
+            logger.info("OpenAI fallback succeeded")
+            return result
+        except Exception as exc:
+            logger.error("OpenAI fallback failed: %s", exc)
+            return None
 
 
 async def safe_generate(prompt: str) -> str | None:
-    """Generate a response; falls back to OpenAI on Gemini 429 or circuit breaker open."""
+    """Generate a response; automatically falls back to the other provider on failure."""
     try:
         return await generate(prompt)
     except pybreaker.CircuitBreakerError:
-        logger.warning("LLM circuit breaker OPEN — trying OpenAI fallback")
-        return await _openai_fallback(prompt)
+        logger.warning("LLM circuit breaker OPEN — trying fallback provider")
+        return await _get_fallback(prompt)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 429:
-            logger.warning("LLM rate limited (429) — trying OpenAI fallback")
-            return await _openai_fallback(prompt)
+            logger.warning("LLM rate limited (429) — trying fallback provider")
+            return await _get_fallback(prompt)
         logger.error("LLM generation failed: %s", exc)
         return None
     except Exception as exc:
@@ -196,16 +210,16 @@ async def safe_generate(prompt: str) -> str | None:
 
 
 async def safe_generate_with_tools(prompt: str, tools: list) -> str | None:
-    """Generate with tools; falls back to OpenAI plain generate on 429 or breaker open."""
+    """Generate with tools; automatically falls back to the other provider on failure."""
     try:
         return await generate_with_tools(prompt, tools)
     except pybreaker.CircuitBreakerError:
-        logger.warning("LLM circuit breaker OPEN — trying OpenAI fallback")
-        return await _openai_fallback(prompt)
+        logger.warning("LLM circuit breaker OPEN — trying fallback provider")
+        return await _get_fallback(prompt)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 429:
-            logger.warning("LLM rate limited (429) — trying OpenAI fallback")
-            return await _openai_fallback(prompt)
+            logger.warning("LLM rate limited (429) — trying fallback provider")
+            return await _get_fallback(prompt)
         logger.error("LLM tool generation failed: %s", exc)
         return None
     except Exception as exc:
