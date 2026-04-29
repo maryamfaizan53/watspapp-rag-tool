@@ -22,8 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 COPY app/ app/
 COPY scripts/ scripts/
 
-# FAISS index directory
-RUN mkdir -p indexes && chown appuser:appgroup indexes
+# FAISS index directory and fastembed cache — must be owned by appuser
+RUN mkdir -p indexes /tmp/fastembed_cache /tmp/hf_cache \
+    && chown -R appuser:appgroup indexes /tmp/fastembed_cache /tmp/hf_cache
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
