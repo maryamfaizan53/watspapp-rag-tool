@@ -86,10 +86,10 @@ https://<your-hf-username>-psx-rag-chatbot.hf.space
 ```
 
 **Telegram:**
-```bash
-curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+`curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://<your-hf-username>-psx-rag-chatbot.hf.space/webhooks/telegram/<tenant_id>"}'
+  -d '{"url": "https://<your-hf-username>-psx-rag-chatbot.hf.space/webhooks/telegram/<tenant_id>"}'``bash
+
 ```
 
 **WhatsApp (Meta dashboard):**
