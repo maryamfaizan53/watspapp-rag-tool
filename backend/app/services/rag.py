@@ -9,31 +9,34 @@ from app.db import faiss_store
 from app.db.models import Conversation, Message, DocumentChunk
 from app.schemas.conversation import ConversationStatus
 from app.services import embeddings, llm
-from app.services.psx_tools import GEMINI_TOOLS
+from app.services.psx_tools import ALL_TOOLS
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_NO_DATA = (
-    "I don't have enough information in my knowledge base to answer that question. "
-    "Please contact the administrator to upload relevant PSX documents."
-)
 FALLBACK_LLM_DOWN = (
     "The AI service is temporarily unavailable. Please try again shortly."
 )
 
 SYSTEM_PROMPT = """You are a helpful PSX (Pakistan Stock Exchange) financial assistant.
-Answer questions about PSX-listed companies, stock market data, financial reports, and related topics.
-If the question is not about PSX or financial markets, politely decline.
 
-You have access to live PSX market data tools. Use them when the user asks about:
-- Current/live/today's stock prices
-- KSE-100 index value
-- Company details (market cap, P/E ratio, 52-week high/low)
-- Finding a stock symbol by company name
+You help investors with all PSX-related topics including:
+- Live stock prices and KSE-100 index (use get_stock_price, get_kse100_index tools)
+- Company fundamentals: market cap, P/E ratio, dividends (use get_company_info tool)
+- Finding stock symbols by company name (use search_psx_symbol tool)
+- How to open a PSX / CDC trading account (use web_search tool)
+- Account opening requirements and documents (use web_search tool)
+- Dividend announcements and payment dates (use web_search tool)
+- Trade signals and market analysis (use web_search tool)
+- SECP regulations, broker information, PSX rules (use web_search tool)
 
-For questions about general PSX knowledge, regulations, or historical info, use the context below.
+TOOL USAGE RULES:
+1. For LIVE prices or index values — ALWAYS use the price/index tools, never guess.
+2. For PSX procedures, account info, dividends, regulations — use web_search with a specific query like:
+   "how to open PSX CDC account Pakistan 2024" or "OGDC dividend announcement 2024"
+3. Use knowledge base context below when available — it may contain tenant-specific documents.
+4. If the question is completely unrelated to finance or PSX, politely decline.
 
-Context from knowledge base:
+Knowledge base context (from uploaded documents):
 {context}
 
 Conversation history:
@@ -50,7 +53,6 @@ async def get_or_create_conversation(
     bot_user_id: str | UUID,
     platform: str,
 ) -> Conversation:
-    """Find the active session or create a new one (30-min inactivity rule)."""
     tid = UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
     buid = UUID(bot_user_id) if isinstance(bot_user_id, str) else bot_user_id
 
@@ -64,16 +66,13 @@ async def get_or_create_conversation(
     conv = result.scalar_one_or_none()
 
     if conv:
-        # Check if expired (30 mins)
         now = datetime.now(timezone.utc)
         last = conv.last_message_at
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
-        
         if (now - last).total_seconds() <= 1800:
             return conv
 
-    # Create new conversation
     new_conv = Conversation(
         tenant_id=tid,
         bot_user_id=buid,
@@ -90,15 +89,13 @@ async def get_or_create_conversation(
 
 
 async def update_conversation(db: AsyncSession, conversation_id: str | UUID) -> None:
-    """Bump last_message_at and increment message_count."""
     cid = UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
-    
     query = (
         update(Conversation)
         .where(Conversation.id == cid)
         .values(
             last_message_at=datetime.now(timezone.utc),
-            message_count=Conversation.message_count + 1
+            message_count=Conversation.message_count + 1,
         )
     )
     await db.execute(query)
@@ -106,7 +103,6 @@ async def update_conversation(db: AsyncSession, conversation_id: str | UUID) -> 
 
 
 async def _get_recent_history(db: AsyncSession, conversation_id: UUID, limit: int = 5) -> list[Message]:
-    """Fetch the last N messages from a conversation."""
     query = (
         select(Message)
         .where(Message.conversation_id == conversation_id)
@@ -115,7 +111,7 @@ async def _get_recent_history(db: AsyncSession, conversation_id: UUID, limit: in
     )
     result = await db.execute(query)
     messages = list(result.scalars().all())
-    messages.reverse()  # chronological order
+    messages.reverse()
     return messages
 
 
@@ -125,40 +121,28 @@ async def answer_query(
     conversation_id: str | UUID,
     query_text: str,
 ) -> tuple[str, list[str]]:
-    """
-    Full RAG pipeline: embed → search → prompt → generate.
-    Returns (answer_text, list_of_chunk_ids_used).
-    """
+    """Full RAG pipeline: embed → search → prompt → generate with tools."""
     tid = str(tenant_id)
     cid = UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
 
     # 1. Embed the query
     query_vector = embeddings.embed_text(query_text)
 
-    # 2. FAISS similarity search
+    # 2. FAISS similarity search (non-blocking — LLM+tools handle gaps)
     results = faiss_store.search(tid, query_vector, top_k=5)
-    if not results:
-        return FALLBACK_NO_DATA, []
 
     # 3. Fetch chunk texts from PostgreSQL
-    # results contains (placeholder_chunk_id, distance)
-    # Our placeholder_chunk_id was f"{document_id}_{chunk_index}"
-    # But we can also search by faiss_vector_id if we store it.
-    # faiss_store returns the placeholder string we gave it.
-    
-    # Let's extract document_id and chunk_index from placeholder
     context_parts = []
     chunk_ids_used = []
-    
+
     for placeholder, _ in results:
         try:
             doc_id_str, chunk_idx_str = placeholder.split("_")
             did = UUID(doc_id_str)
             cidx = int(chunk_idx_str)
-            
             query = select(DocumentChunk).where(
                 DocumentChunk.document_id == did,
-                DocumentChunk.chunk_index == cidx
+                DocumentChunk.chunk_index == cidx,
             )
             res = await db.execute(query)
             chunk = res.scalar_one_or_none()
@@ -168,7 +152,12 @@ async def answer_query(
         except Exception:
             logger.warning("Failed to parse FAISS placeholder: %s", placeholder)
 
-    context = "\n\n".join(context_parts)
+    # If no docs found, still proceed — tools and web search will cover the gaps
+    context = (
+        "\n\n".join(context_parts)
+        if context_parts
+        else "No documents uploaded yet. Use your tools and web search to answer."
+    )
 
     # 4. Build conversation history string
     history_msgs = await _get_recent_history(db, cid)
@@ -179,9 +168,9 @@ async def answer_query(
         history_lines.append(f"{role}: {text}")
     history = "\n".join(history_lines) if history_lines else "No prior conversation."
 
-    # 5. Build prompt and call LLM with live PSX tools
+    # 5. Build prompt and call LLM with tools
     prompt = SYSTEM_PROMPT.format(context=context, history=history, question=query_text)
-    answer = await llm.safe_generate_with_tools(prompt, GEMINI_TOOLS)
+    answer = await llm.safe_generate_with_tools(prompt, ALL_TOOLS)
 
     if answer is None:
         return FALLBACK_LLM_DOWN, []

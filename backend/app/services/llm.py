@@ -1,3 +1,4 @@
+import json
 import logging
 import httpx
 import pybreaker
@@ -15,26 +16,16 @@ _breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=20)
 
 
 async def _generate_ollama(prompt: str) -> str:
-    """Send a prompt to Ollama."""
-    payload = {
-        "model": settings.ollama_model,
-        "prompt": prompt,
-        "stream": False,
-    }
+    payload = {"model": settings.ollama_model, "prompt": prompt, "stream": False}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            f"{settings.ollama_base_url}/api/generate",
-            json=payload,
-        )
+        response = await client.post(f"{settings.ollama_base_url}/api/generate", json=payload)
         response.raise_for_status()
         return response.json().get("response", "").strip()
 
 
 async def _generate_gemini(prompt: str) -> str:
-    """Send a plain prompt to Google Gemini API (no tools)."""
     if not settings.gemini_api_key:
         raise ValueError("GEMINI_API_KEY is not set")
-
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
@@ -49,10 +40,8 @@ async def _generate_gemini(prompt: str) -> str:
 
 
 async def _generate_openai(prompt: str) -> str:
-    """Send a plain prompt to OpenAI Chat Completions API."""
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is not set")
-
     payload = {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
@@ -69,14 +58,11 @@ async def _generate_openai(prompt: str) -> str:
 
 
 async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
-    """
-    Send a prompt to Gemini with function calling tools.
-    Handles multi-turn tool call → result → final answer loop.
-    """
     if not settings.gemini_api_key:
         raise ValueError("GEMINI_API_KEY is not set")
 
     from app.services.psx_tools import TOOL_FUNCTIONS
+    import inspect
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
     contents = [{"role": "user", "parts": [{"text": prompt}]}]
@@ -99,10 +85,9 @@ async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
             for fc in func_calls:
                 func_name = fc["name"]
                 func_args = fc.get("args", {})
-                logger.info("Calling PSX tool: %s(%s)", func_name, func_args)
+                logger.info("Gemini calling tool: %s(%s)", func_name, func_args)
                 tool_fn = TOOL_FUNCTIONS.get(func_name)
                 if tool_fn:
-                    import inspect
                     result = await tool_fn(**func_args) if inspect.iscoroutinefunction(tool_fn) else tool_fn(**func_args)
                 else:
                     result = {"error": f"Unknown tool: {func_name}"}
@@ -118,9 +103,59 @@ async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
     return "I was unable to complete the request. Please try again."
 
 
+async def _generate_openai_with_tools(prompt: str, tools: list) -> str:
+    if not settings.openai_api_key:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    from app.services.psx_tools import TOOL_FUNCTIONS
+    import inspect
+
+    messages = [{"role": "user", "content": prompt}]
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for _ in range(5):
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "max_tokens": 1024,
+            }
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data["choices"][0]
+            message = choice["message"]
+
+            if choice["finish_reason"] == "tool_calls" and message.get("tool_calls"):
+                messages.append(message)
+                for tc in message["tool_calls"]:
+                    func_name = tc["function"]["name"]
+                    func_args = json.loads(tc["function"]["arguments"])
+                    logger.info("OpenAI calling tool: %s(%s)", func_name, func_args)
+                    tool_fn = TOOL_FUNCTIONS.get(func_name)
+                    if tool_fn:
+                        result = await tool_fn(**func_args) if inspect.iscoroutinefunction(tool_fn) else tool_fn(**func_args)
+                    else:
+                        result = {"error": f"Unknown tool: {func_name}"}
+                    logger.info("Tool result: %s", result)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps(result),
+                    })
+            else:
+                return message.get("content", "").strip()
+
+    return "I was unable to complete the request. Please try again."
+
+
 @_breaker
 async def generate(prompt: str) -> str:
-    """Send a prompt to the configured LLM and return the generated text."""
     provider = settings.llm_provider.lower()
     try:
         if provider == "ollama":
@@ -143,14 +178,14 @@ async def generate(prompt: str) -> str:
 
 
 @_breaker
-async def generate_with_tools(prompt: str, tools: list) -> str:
-    """Send a prompt with tool support (Gemini only). Falls back to plain generate for others."""
+async def generate_with_tools(prompt: str, tools: dict) -> str:
+    """Send a prompt with tool support. tools must be {'gemini': [...], 'openai': [...]}."""
     provider = settings.llm_provider.lower()
     try:
         if provider == "gemini":
-            return await _generate_gemini_with_tools(prompt, tools)
+            return await _generate_gemini_with_tools(prompt, tools.get("gemini", []))
         elif provider == "openai":
-            return await _generate_openai(prompt)
+            return await _generate_openai_with_tools(prompt, tools.get("openai", []))
         else:
             return await _generate_ollama(prompt)
     except httpx.TimeoutException as exc:
@@ -165,10 +200,8 @@ async def generate_with_tools(prompt: str, tools: list) -> str:
 
 
 async def _get_fallback(prompt: str) -> str | None:
-    """Return a response from the fallback provider (opposite of the primary)."""
     provider = settings.llm_provider.lower()
     if provider == "openai":
-        # Primary is OpenAI → fall back to Gemini
         if not settings.gemini_api_key:
             return None
         try:
@@ -179,7 +212,6 @@ async def _get_fallback(prompt: str) -> str | None:
             logger.error("Gemini fallback failed: %s", exc)
             return None
     else:
-        # Primary is Gemini/Ollama → fall back to OpenAI
         if not settings.openai_api_key:
             return None
         try:
@@ -192,7 +224,6 @@ async def _get_fallback(prompt: str) -> str | None:
 
 
 async def safe_generate(prompt: str) -> str | None:
-    """Generate a response; automatically falls back to the other provider on failure."""
     try:
         return await generate(prompt)
     except pybreaker.CircuitBreakerError:
@@ -209,8 +240,7 @@ async def safe_generate(prompt: str) -> str | None:
         return None
 
 
-async def safe_generate_with_tools(prompt: str, tools: list) -> str | None:
-    """Generate with tools; automatically falls back to the other provider on failure."""
+async def safe_generate_with_tools(prompt: str, tools: dict) -> str | None:
     try:
         return await generate_with_tools(prompt, tools)
     except pybreaker.CircuitBreakerError:
