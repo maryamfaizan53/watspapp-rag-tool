@@ -114,11 +114,13 @@ async def _generate_openai_with_tools(prompt: str, tools: list) -> str:
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         for _ in range(5):
+            # Force tool use on first call so model never hallucinates live data
+            tool_choice = "required" if len(messages) == 1 else "auto"
             payload = {
                 "model": "gpt-4o-mini",
                 "messages": messages,
                 "tools": tools,
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
                 "max_tokens": 1024,
             }
             resp = await client.post(
