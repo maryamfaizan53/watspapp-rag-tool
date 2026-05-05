@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import faiss_store
 from app.db.models import Conversation, Message, DocumentChunk
 from app.services import embeddings, llm
-from app.services.psx_tools import ALL_TOOLS, _resolve_symbol, _yf_price, web_search as _web_search, _KNOWN_PSX_SYMBOLS, _CURRENT_YEAR
+from app.services.psx_tools import ALL_TOOLS, _resolve_symbol, get_stock_price_by_query as _fetch_price, _KNOWN_PSX_SYMBOLS
 
 logger = logging.getLogger(__name__)
 
@@ -67,26 +67,18 @@ Answer:"""
 async def _prefetch_stock_data(query_text: str) -> str:
     """
     Detect a known PSX company in the query and pre-fetch its price in Python.
-    Returns a JSON/text string with the data, or "" if no known stock was found.
-    This bypasses the LLM's tendency to 'correct' company names before tool calls.
+    Returns a string with the data, or "" if no known stock was found.
+    Uses full fallback chain: Yahoo Finance → PSX portal → web search.
+    Bypasses the LLM's tendency to 'correct' company names before tool calls.
     """
     resolved = _resolve_symbol(query_text)
     if resolved not in _KNOWN_PSX_SYMBOLS:
         return ""
 
-    logger.info("Pre-fetching price for resolved symbol: %s (query: %s)", resolved, query_text)
-
-    price = await _yf_price(resolved)
-    if price:
-        return json.dumps(price, indent=2)
-
-    # YF unavailable — fall back to web search
-    search = await _web_search(
-        f"{resolved} share price PSX Pakistan today {_CURRENT_YEAR}", max_results=3
-    )
-    if "results" in search:
-        return f"symbol: {resolved}\nsource: web search\n\n{search['results']}"
-
+    logger.info("Pre-fetching price for %s (from query: %s)", resolved, query_text)
+    result = await _fetch_price(query_text)
+    if "error" not in result:
+        return json.dumps(result, indent=2)
     return ""
 
 
@@ -214,11 +206,11 @@ async def answer_query(
     live_data = await _prefetch_stock_data(query_text)
 
     if live_data:
-        # Data is ready — LLM just formats the answer, no forced tool call needed
+        # Data already fetched — LLM just formats it, no tools needed
         prompt = _PROMPT_WITH_LIVE_DATA.format(
             live_data=live_data, context=context, history=history, question=query_text
         )
-        answer = await llm.safe_generate_with_tools(prompt, ALL_TOOLS, force_tool=False)
+        answer = await llm.safe_generate(prompt)
     else:
         # Unknown stock or non-stock query — let LLM pick the right tool
         prompt = _PROMPT_WITH_TOOLS.format(

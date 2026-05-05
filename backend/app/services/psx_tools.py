@@ -145,6 +145,47 @@ async def _yf_price(symbol: str) -> dict | None:
         return None
 
 
+async def _psx_portal_price(symbol: str) -> dict | None:
+    """Fetch live price from PSX data portal (dps.psx.com.pk) for stocks not on Yahoo Finance."""
+    import re as _re
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    urls = [
+        f"https://dps.psx.com.pk/company/{symbol.upper()}",
+        f"https://scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={symbol.upper()}",
+    ]
+    price_patterns = [
+        r'"ldcp"\s*:\s*"?([\d.]+)"?',
+        r'"currentPrice"\s*:\s*"?([\d.]+)"?',
+        r'"close"\s*:\s*"?([\d.]+)"?',
+        r'"lastSale"\s*:\s*"?([\d.]+)"?',
+        r'"price"\s*:\s*"?([\d.]+)"?',
+        r'LDCP[^>]*>\s*([\d,]+\.?\d*)',
+        r'Last\s+(?:Sale|Price)[^>]*>\s*([\d,]+\.?\d*)',
+    ]
+    for url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=False, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    continue
+                text = resp.text
+                for pattern in price_patterns:
+                    m = _re.search(pattern, text, _re.IGNORECASE)
+                    if m:
+                        raw = m.group(1).replace(",", "")
+                        price = float(raw)
+                        if 1.0 < price < 200_000:
+                            logger.info("PSX portal price for %s: %.2f (url=%s)", symbol, price, url)
+                            return {
+                                "symbol": symbol.upper(),
+                                "current_price_pkr": price,
+                                "source": "PSX Data Portal",
+                            }
+        except Exception as exc:
+            logger.warning("PSX portal fetch failed for %s (%s): %s", symbol, url, exc)
+    return None
+
+
 # ── Public tools ──────────────────────────────────────────────────────────────
 
 async def get_stock_price_by_query(query: str) -> dict:
@@ -157,20 +198,26 @@ async def get_stock_price_by_query(query: str) -> dict:
     if result:
         return result
 
-    # 2. Fallback: targeted web search
-    logger.info("YF failed for %s — using web search fallback", symbol)
+    # 2. Try PSX data portal (covers stocks not on Yahoo Finance)
+    logger.info("YF failed for %s — trying PSX portal", symbol)
+    result = await _psx_portal_price(symbol)
+    if result:
+        return result
+
+    # 3. Fallback: web search
+    logger.info("PSX portal failed for %s — using web search", symbol)
     search = await web_search(
-        f"{symbol} share price PSX Pakistan today {_CURRENT_YEAR}",
+        f"{symbol} PSX share price Pakistan closing price {_CURRENT_YEAR}",
         max_results=4,
     )
     if "results" in search:
         return {
             "symbol": symbol,
             "source": "web_search",
-            "note": f"Live API data unavailable for {symbol}. Latest info from web:",
+            "note": f"Live API unavailable for {symbol}. Price info from web search:",
             "results": search["results"],
         }
-    return {"error": f"Could not fetch price for '{query}' ({symbol}). The stock may not be listed or market is closed."}
+    return {"error": f"Could not fetch price for '{query}' ({symbol})."}
 
 
 async def get_kse100_index() -> dict:
