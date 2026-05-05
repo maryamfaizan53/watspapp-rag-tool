@@ -103,7 +103,7 @@ async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
     return "I was unable to complete the request. Please try again."
 
 
-async def _generate_openai_with_tools(prompt: str, tools: list) -> str:
+async def _generate_openai_with_tools(prompt: str, tools: list, force_tool: bool = True) -> str:
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is not set")
 
@@ -114,8 +114,7 @@ async def _generate_openai_with_tools(prompt: str, tools: list) -> str:
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         for _ in range(5):
-            # Force tool use on first call so model never hallucinates live data
-            tool_choice = "required" if len(messages) == 1 else "auto"
+            tool_choice = "required" if (force_tool and len(messages) == 1) else "auto"
             payload = {
                 "model": "gpt-4o-mini",
                 "messages": messages,
@@ -180,14 +179,14 @@ async def generate(prompt: str) -> str:
 
 
 @_breaker
-async def generate_with_tools(prompt: str, tools: dict) -> str:
+async def generate_with_tools(prompt: str, tools: dict, force_tool: bool = True) -> str:
     """Send a prompt with tool support. tools must be {'gemini': [...], 'openai': [...]}."""
     provider = settings.llm_provider.lower()
     try:
         if provider == "gemini":
             return await _generate_gemini_with_tools(prompt, tools.get("gemini", []))
         elif provider == "openai":
-            return await _generate_openai_with_tools(prompt, tools.get("openai", []))
+            return await _generate_openai_with_tools(prompt, tools.get("openai", []), force_tool=force_tool)
         else:
             return await _generate_ollama(prompt)
     except httpx.TimeoutException as exc:
@@ -242,9 +241,9 @@ async def safe_generate(prompt: str) -> str | None:
         return None
 
 
-async def safe_generate_with_tools(prompt: str, tools: dict) -> str | None:
+async def safe_generate_with_tools(prompt: str, tools: dict, force_tool: bool = True) -> str | None:
     try:
-        return await generate_with_tools(prompt, tools)
+        return await generate_with_tools(prompt, tools, force_tool=force_tool)
     except pybreaker.CircuitBreakerError:
         logger.warning("LLM circuit breaker OPEN — trying fallback provider")
         return await _get_fallback(prompt)

@@ -96,6 +96,9 @@ def _resolve_symbol(query: str) -> str:
     return query.upper()
 
 
+# Set of all known PSX symbols — used by rag.py for pre-fetch detection
+_KNOWN_PSX_SYMBOLS: set[str] = set(_PSX_NAME_MAP.values())
+
 # ── Data fetchers ─────────────────────────────────────────────────────────────
 
 async def _yf_fetch(symbol: str) -> dict:
