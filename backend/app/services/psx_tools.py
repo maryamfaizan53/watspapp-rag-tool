@@ -147,125 +147,216 @@ async def _yf_price(symbol: str) -> dict | None:
 
 async def _psx_live_price(symbol: str) -> dict | None:
     """
-    Fetch live price from psx.com.pk and dps.psx.com.pk.
-    Tries JSON API endpoints first, then falls back to HTML parsing.
+    Fetch live PSX price. Tries multiple sources in order:
+    1. PSX EOD timeseries API  2. PSX quotes JSON  3. HTML scraping (broker sites)
     """
-    import re as _re
     sym = symbol.upper()
-    headers = {
+    browser_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/html, */*",
-        "Referer": "https://www.psx.com.pk/",
-        "Origin": "https://www.psx.com.pk",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
-    # ── 1. Try PSX JSON API endpoints ─────────────────────────────────────────
+    # ── 1. PSX EOD timeseries API — most structured JSON response ─────────────
+    for ts_url in [
+        f"https://dps.psx.com.pk/timeseries/eod?q={sym}",
+        f"https://dps.psx.com.pk/timeseries/eod?company={sym}",
+        f"https://dps.psx.com.pk/timeseries/intraday?q={sym}",
+    ]:
+        try:
+            async with httpx.AsyncClient(timeout=8.0, verify=False, headers=browser_headers) as client:
+                resp = await client.get(ts_url)
+                if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
+                    data = resp.json()
+                    rows = data if isinstance(data, list) else data.get("data", [])
+                    if rows:
+                        row = rows[-1]
+                        price = 0.0
+                        for key in ("c", "close", "ldcp", "last", "price"):
+                            if row.get(key):
+                                try:
+                                    price = float(str(row[key]).replace(",", ""))
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                        if price > 1.0:
+                            logger.info("PSX timeseries price for %s: %.2f (url=%s)", sym, price, ts_url)
+                            prev = float(str(row.get("o") or row.get("open") or row.get("prev") or price).replace(",", ""))
+                            change = round(price - prev, 2)
+                            pct = round((change / prev) * 100, 2) if prev else 0.0
+                            return {
+                                "symbol": sym,
+                                "current_price_pkr": round(price, 2),
+                                "previous_close_pkr": round(prev, 2),
+                                "change_pkr": change,
+                                "change_percent": pct,
+                                "source": "PSX Live (dps.psx.com.pk)",
+                            }
+        except Exception as exc:
+            logger.debug("PSX timeseries %s failed: %s", ts_url, exc)
+
+    # ── 2. PSX quotes/snapshot JSON endpoints ────────────────────────────────
+    psx_headers = {**browser_headers, "Referer": "https://www.psx.com.pk/", "Origin": "https://www.psx.com.pk"}
     json_endpoints = [
         f"https://dps.psx.com.pk/quotes?company={sym}",
         f"https://dps.psx.com.pk/company/{sym}/json",
         f"https://www.psx.com.pk/api/equity/snapshot?symbol={sym}",
-        f"https://www.psx.com.pk/data/equity/{sym}",
     ]
-    json_price_keys = ["currentPrice", "ldcp", "LDCP", "close", "lastSale", "price", "ltp", "last"]
+    json_price_keys = ["currentPrice", "ldcp", "LDCP", "close", "lastSale", "price", "ltp", "last", "cP", "CurrPrice"]
 
     for url in json_endpoints:
         try:
-            async with httpx.AsyncClient(timeout=8.0, verify=False, headers=headers) as client:
+            async with httpx.AsyncClient(timeout=8.0, verify=False, headers=psx_headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     continue
-                ct = resp.headers.get("content-type", "")
-                if "json" in ct:
-                    data = resp.json()
-                    # Handle list or dict response
-                    item = data[0] if isinstance(data, list) and data else data
-                    if isinstance(item, dict):
-                        for key in json_price_keys:
-                            val = item.get(key) or item.get(key.lower())
-                            if val is not None:
-                                try:
-                                    price = float(str(val).replace(",", ""))
-                                    if 1.0 < price < 200_000:
-                                        prev = float(str(item.get("previousClose") or item.get("prev") or price).replace(",", ""))
-                                        change = round(price - prev, 2)
-                                        pct = round((change / prev) * 100, 2) if prev else 0.0
-                                        logger.info("PSX JSON price for %s: %.2f (url=%s)", sym, price, url)
-                                        return {
-                                            "symbol": sym,
-                                            "company_name": item.get("companyName") or item.get("name") or sym,
-                                            "current_price_pkr": round(price, 2),
-                                            "previous_close_pkr": round(prev, 2),
-                                            "change_pkr": change,
-                                            "change_percent": pct,
-                                            "source": "PSX Live (psx.com.pk)",
-                                        }
-                                except (ValueError, TypeError):
-                                    pass
+                if "json" not in resp.headers.get("content-type", ""):
+                    continue
+                data = resp.json()
+                item = data[0] if isinstance(data, list) and data else data
+                if not isinstance(item, dict):
+                    continue
+                for key in json_price_keys:
+                    val = item.get(key) or item.get(key.lower())
+                    if val is None:
+                        continue
+                    try:
+                        price = float(str(val).replace(",", ""))
+                        if 1.0 < price < 200_000:
+                            prev = float(str(item.get("previousClose") or item.get("prev") or price).replace(",", ""))
+                            change = round(price - prev, 2)
+                            pct = round((change / prev) * 100, 2) if prev else 0.0
+                            logger.info("PSX JSON price for %s: %.2f (url=%s)", sym, price, url)
+                            return {
+                                "symbol": sym,
+                                "company_name": item.get("companyName") or item.get("name") or sym,
+                                "current_price_pkr": round(price, 2),
+                                "previous_close_pkr": round(prev, 2),
+                                "change_pkr": change,
+                                "change_percent": pct,
+                                "source": "PSX Live (psx.com.pk)",
+                            }
+                    except (ValueError, TypeError):
+                        pass
         except Exception as exc:
             logger.debug("PSX JSON endpoint failed %s: %s", url, exc)
 
-    # ── 2. Try HTML page parsing ───────────────────────────────────────────────
-    html_urls = [
-        f"https://dps.psx.com.pk/company/{sym}",
-        f"https://scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
-        f"https://www.psx.com.pk/market-summary/equity/{sym}",
+    # ── 3. HTML scraping: PSX portal + broker sites (globally accessible) ─────
+    html_sources = [
+        (
+            f"https://dps.psx.com.pk/company/{sym}",
+            [
+                r'"ldcp"\s*:\s*"?([\d.]+)"?',
+                r'"currentPrice"\s*:\s*"?([\d.]+)"?',
+                r'"close"\s*:\s*"?([\d.]+)"?',
+                r'"ltp"\s*:\s*"?([\d.]+)"?',
+                r'"cP"\s*:\s*"?([\d.]+)"?',
+                r'LDCP[^<>]{0,30}>([\d,]+\.?\d*)',
+            ],
+        ),
+        (
+            f"https://scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
+            [
+                r'Current Price[^<>]{0,30}>([\d,]+\.?\d*)',
+                r'Last Sale[^<>]{0,30}>([\d,]+\.?\d*)',
+                r'id="lblCurrentPrice"[^>]*>([\d,]+\.?\d*)',
+                r'([\d,]+\.\d{2})</span>',
+            ],
+        ),
+        (
+            f"https://www.scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
+            [r'([\d,]+\.\d{2})'],
+        ),
     ]
-    html_patterns = [
-        r'"ldcp"\s*:\s*"?([\d.]+)"?',
-        r'"currentPrice"\s*:\s*"?([\d.]+)"?',
-        r'"close"\s*:\s*"?([\d.]+)"?',
-        r'"ltp"\s*:\s*"?([\d.]+)"?',
-        r'"last"\s*:\s*"?([\d.]+)"?',
-        r'LDCP[^<>]{0,30}>([\d,]+\.?\d*)',
-        r'Current Price[^<>]{0,30}>([\d,]+\.?\d*)',
-        r'Last Sale[^<>]{0,30}>([\d,]+\.?\d*)',
-        r'data-value="([\d.]+)"',
-    ]
-    for url in html_urls:
+    for url, patterns in html_sources:
         try:
-            async with httpx.AsyncClient(timeout=10.0, verify=False, headers=headers) as client:
+            async with httpx.AsyncClient(timeout=10.0, verify=False, headers=browser_headers, follow_redirects=True) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     continue
                 text = resp.text
-                for pattern in html_patterns:
-                    m = _re.search(pattern, text, _re.IGNORECASE)
+                for pattern in patterns:
+                    m = re.search(pattern, text, re.IGNORECASE)
                     if m:
-                        raw = m.group(1).replace(",", "")
-                        price = float(raw)
-                        if 1.0 < price < 200_000:
-                            logger.info("PSX HTML price for %s: %.2f (url=%s)", sym, price, url)
-                            return {
-                                "symbol": sym,
-                                "current_price_pkr": price,
-                                "source": "PSX Website",
-                            }
+                        try:
+                            price = float(m.group(1).replace(",", ""))
+                            if 1.0 < price < 200_000:
+                                logger.info("PSX HTML price for %s: %.2f (url=%s)", sym, price, url)
+                                return {"symbol": sym, "current_price_pkr": price, "source": "PSX Website"}
+                        except ValueError:
+                            pass
         except Exception as exc:
             logger.warning("PSX HTML fetch failed for %s (%s): %s", sym, url, exc)
 
     return None
 
 
+async def _web_price_extract(symbol: str) -> dict | None:
+    """
+    Targeted web search + Python regex price extraction.
+    Returns a price dict WITHOUT going through the LLM for formatting.
+    Used when PSX live and Yahoo Finance both fail.
+    """
+    try:
+        month_year = datetime.now().strftime("%B %Y")
+        search = await web_search(
+            f'"{symbol}" PSX share price today PKR Pakistan {month_year}',
+            max_results=6,
+        )
+        text = search.get("results", "")
+        if not text:
+            return None
+
+        price_patterns = [
+            r'(?:PKR|Rs\.?)\s*([\d,]{2,7}\.?\d{0,2})',           # PKR 311.42
+            r'([\d,]{2,7}\.\d{2})\s*(?:PKR|Rs)',                  # 311.42 PKR
+            rf'{re.escape(symbol)}[^\n]{{0,80}}?([\d,]{{2,7}}\.\d{{2}})',  # OGDC ... 311.42
+            r'(?:current price|close|last sale|ldcp)[^\n]{0,25}?([\d,]{2,7}\.?\d{0,2})',
+        ]
+        for pattern in price_patterns:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                try:
+                    price = float(m.group(1).replace(",", ""))
+                    if 10.0 < price < 200_000:
+                        logger.info("Web search price extract for %s: %.2f", symbol, price)
+                        return {
+                            "symbol": symbol,
+                            "current_price_pkr": round(price, 2),
+                            "source": "Web Search",
+                        }
+                except ValueError:
+                    pass
+    except Exception as exc:
+        logger.debug("_web_price_extract failed for %s: %s", symbol, exc)
+    return None
+
+
 # ── Public tools ──────────────────────────────────────────────────────────────
 
 async def get_stock_price_by_query(query: str) -> dict:
-    """Get live PSX stock price. Tries PSX direct first (most accurate), then Yahoo Finance, then web search."""
+    """Get live PSX stock price. Priority: PSX live → Yahoo Finance → web price extract → raw web search."""
     symbol = _resolve_symbol(query)
     logger.info("get_stock_price_by_query: query=%s resolved=%s", query, symbol)
 
-    # 1. PSX live — primary source (psx.com.pk owns the data, always most accurate)
+    # 1. PSX live — official source (timeseries → JSON → HTML)
     result = await _psx_live_price(symbol)
     if result:
         return result
     logger.info("PSX live failed for %s — trying Yahoo Finance", symbol)
 
-    # 2. Yahoo Finance — secondary (may have stale or adjusted prices for some stocks)
+    # 2. Yahoo Finance — secondary (may be stale for some PSX stocks)
     result = await _yf_price(symbol)
     if result:
         return result
-    logger.info("YF also failed for %s — using web search", symbol)
+    logger.info("YF failed for %s — trying web price extraction", symbol)
 
-    # 3. Web search — final fallback
+    # 3. Web search + Python price extraction (bypasses LLM formatting)
+    result = await _web_price_extract(symbol)
+    if result:
+        return result
+    logger.info("Web price extract failed for %s — using raw web search", symbol)
+
+    # 4. Raw web search — LLM formats the answer from text snippets
     search = await web_search(
         f"{symbol} PSX share price Pakistan today {_CURRENT_YEAR}",
         max_results=4,
