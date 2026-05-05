@@ -139,26 +139,45 @@ async def get_company_info(symbol: str) -> dict:
         return {"error": f"Could not fetch company info for '{symbol}': {exc}"}
 
 
+def _resolve_symbol(query: str) -> str:
+    """Resolve a company name or symbol string to a PSX ticker. Returns the ticker (may still be wrong if unknown)."""
+    q = query.lower().strip()
+    if q in _PSX_NAME_MAP:
+        return _PSX_NAME_MAP[q]
+    for key, sym in _PSX_NAME_MAP.items():
+        if key in q or q in key:
+            return sym
+    return query.upper()
+
+
 async def search_psx_symbol(company_name: str) -> dict:
     """Find a PSX stock symbol from a company name."""
-    query = company_name.lower().strip()
-    # Exact match first to avoid substring collisions (e.g. "engro" matching "engroh")
-    if query in _PSX_NAME_MAP:
-        return {"symbol": _PSX_NAME_MAP[query], "matched_name": query.title()}
-    for key, symbol in _PSX_NAME_MAP.items():
-        if key in query or query in key:
-            return {"symbol": symbol, "matched_name": key.title()}
-    ticker = f"{company_name.upper()}.KA"
+    symbol = _resolve_symbol(company_name)
+    ticker = f"{symbol}.KA"
     try:
         data = await _yf_fetch(ticker)
         if data["chart"]["result"]:
-            return {"symbol": company_name.upper(), "note": "Direct symbol match"}
+            return {"symbol": symbol, "note": "Symbol resolved"}
     except Exception:
         pass
     return {
         "error": f"Could not find a PSX symbol for '{company_name}'. "
                  "Try the stock symbol directly (e.g. OGDC, HBL, PSO, MCB, LUCK)."
     }
+
+
+async def get_stock_price_by_query(query: str) -> dict:
+    """Get current PSX stock price from any company name or symbol. Handles resolution and fallback automatically."""
+    symbol = _resolve_symbol(query)
+    result = await get_stock_price(symbol)
+    if "error" not in result:
+        return result
+    # Yahoo Finance failed — fall back to web search
+    logger.warning("YF failed for %s, falling back to web_search", symbol)
+    search = await web_search(f"{query} PSX stock price today PKR")
+    if "results" in search:
+        return {"symbol": symbol, "note": "Live API unavailable. Web search result below.", **search}
+    return {"error": f"Could not fetch price for '{query}'. Market may be closed or symbol not listed on Yahoo Finance."}
 
 
 async def web_search(query: str, max_results: int = 4) -> dict:
@@ -191,17 +210,18 @@ GEMINI_TOOLS = [
     {
         "function_declarations": [
             {
-                "name": "get_stock_price",
+                "name": "get_stock_price_by_query",
                 "description": (
-                    "Get the current live stock price for a PSX listed company. "
-                    "Use when asked about current price, today's price, or live price of a stock."
+                    "Get the current live PSX stock price for any company name or symbol. "
+                    "Pass EXACTLY what the user said — e.g. 'engroh', 'habib bank', 'OGDC', 'lucky cement'. "
+                    "This tool handles all symbol resolution and fallback automatically."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL, MCB, LUCK, ENGRO"}
+                        "query": {"type": "string", "description": "Exact company name or symbol as the user typed it"}
                     },
-                    "required": ["symbol"],
+                    "required": ["query"],
                 },
             },
             {
@@ -215,26 +235,15 @@ GEMINI_TOOLS = [
             {
                 "name": "get_company_info",
                 "description": (
-                    "Get detailed company info including market cap, P/E ratio, 52-week high/low, "
-                    "sector and dividend yield for a PSX listed company."
+                    "Get detailed company fundamentals: market cap, P/E ratio, 52-week high/low, "
+                    "sector and dividend yield. Pass the PSX symbol e.g. OGDC, HBL, ENGRO, ENGROH."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL"}
+                        "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL, ENGROH"}
                     },
                     "required": ["symbol"],
-                },
-            },
-            {
-                "name": "search_psx_symbol",
-                "description": "Find the PSX stock symbol for a company by its name.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "company_name": {"type": "string", "description": "Company name e.g. 'Habib Bank', 'Lucky Cement'"}
-                    },
-                    "required": ["company_name"],
                 },
             },
             {
@@ -242,14 +251,14 @@ GEMINI_TOOLS = [
                 "description": (
                     "Search the web for current PSX-related information. Use for: "
                     "how to open a PSX/CDC account, account opening requirements, dividend announcements, "
-                    "trade signals, SECP regulations, broker information, or any PSX topic not in the knowledge base."
+                    "trade signals, SECP regulations, broker information, or any PSX topic not covered by other tools."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query, e.g. 'how to open PSX account Pakistan 2024' or 'PSX dividend announcement OGDC'"
+                            "description": "Search query, e.g. 'how to open PSX account Pakistan 2024'"
                         },
                         "max_results": {
                             "type": "integer",
@@ -269,14 +278,18 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_stock_price",
-            "description": "Get the current live stock price for a PSX listed company.",
+            "name": "get_stock_price_by_query",
+            "description": (
+                "Get the current live PSX stock price for any company name or symbol. "
+                "Pass EXACTLY what the user said — e.g. 'engroh', 'habib bank', 'OGDC', 'lucky cement'. "
+                "This tool handles all symbol resolution and fallback automatically."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL, MCB"}
+                    "query": {"type": "string", "description": "Exact company name or symbol as the user typed it"}
                 },
-                "required": ["symbol"],
+                "required": ["query"],
             },
         },
     },
@@ -292,27 +305,13 @@ OPENAI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_company_info",
-            "description": "Get detailed company info: market cap, P/E ratio, 52-week high/low, dividend yield.",
+            "description": "Get detailed company fundamentals: market cap, P/E ratio, 52-week high/low, dividend yield. Pass the PSX symbol.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL"}
+                    "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL, ENGROH"}
                 },
                 "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_psx_symbol",
-            "description": "Find the PSX stock symbol for a company by its name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "company_name": {"type": "string", "description": "Company name e.g. 'Habib Bank', 'Lucky Cement'"}
-                },
-                "required": ["company_name"],
             },
         },
     },
@@ -323,7 +322,7 @@ OPENAI_TOOLS = [
             "description": (
                 "Search the web for current PSX-related information. Use for: "
                 "how to open a PSX/CDC account, account opening requirements, dividend announcements, "
-                "trade signals, SECP regulations, broker information, or any PSX topic not in the knowledge base."
+                "trade signals, SECP regulations, broker information, or any PSX topic not covered by other tools."
             ),
             "parameters": {
                 "type": "object",
@@ -349,9 +348,8 @@ ALL_TOOLS = {
 }
 
 TOOL_FUNCTIONS = {
-    "get_stock_price": get_stock_price,
+    "get_stock_price_by_query": get_stock_price_by_query,
     "get_kse100_index": get_kse100_index,
     "get_company_info": get_company_info,
-    "search_psx_symbol": search_psx_symbol,
     "web_search": web_search,
 }
