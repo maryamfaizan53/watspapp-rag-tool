@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+from datetime import datetime
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -9,31 +11,92 @@ _YF_HEADERS = {
     "Accept": "application/json",
 }
 
+_CURRENT_YEAR = datetime.now().year
+
+# Expanded PSX name→symbol map (exact match takes priority)
 _PSX_NAME_MAP = {
+    # Energy & Oil
     "ogdcl": "OGDC", "oil and gas development": "OGDC", "ogdc": "OGDC",
     "pso": "PSO", "pakistan state oil": "PSO",
+    "ppl": "PPL", "pakistan petroleum": "PPL",
+    "mari": "MARI", "mari petroleum": "MARI",
+    "pol": "POL", "pakistan oilfields": "POL",
+    "parco": "PARCO", "pak arab refinery": "PARCO",
+    "nrl": "NRL", "national refinery": "NRL",
+    "atrl": "ATRL", "attock refinery": "ATRL",
+    # Power
+    "hubc": "HUBC", "hub power": "HUBC",
+    "kapco": "KAPCO", "kot addu power": "KAPCO",
+    "ncpl": "NCPL", "nishat chunian power": "NCPL",
+    "pkgp": "PKGP",
+    # Banks
     "hbl": "HBL", "habib bank": "HBL",
     "mcb": "MCB", "mcb bank": "MCB",
     "ubl": "UBL", "united bank": "UBL",
-    "luck": "LUCK", "lucky cement": "LUCK",
-    "engro": "ENGRO", "engro corporation": "ENGRO",
-    "engroh": "ENGROH", "engro holdings": "ENGROH",
-    "ppl": "PPL", "pakistan petroleum": "PPL",
     "bafl": "BAFL", "bank alfalah": "BAFL",
-    "ffc": "FFC", "fauji fertilizer": "FFC",
-    "ffbl": "FFBL",
     "abl": "ABL", "allied bank": "ABL",
     "nbp": "NBP", "national bank": "NBP",
-    "ptcl": "PTC", "pakistan telecom": "PTC",
-    "mari": "MARI", "mari petroleum": "MARI",
-    "nestle": "NESTLE", "nestle pakistan": "NESTLE",
-    "hubc": "HUBC", "hub power": "HUBC",
-    "kapco": "KAPCO",
+    "bahl": "BAHL", "bank al habib": "BAHL",
+    "mebl": "MEBL", "meezan bank": "MEBL",
+    "scbpl": "SCBPL", "standard chartered": "SCBPL",
+    "silk": "SILK", "silkbank": "SILK",
+    "jsbl": "JSBL", "js bank": "JSBL",
+    # Chemicals / Fertilizers
+    "engro": "ENGRO", "engro corporation": "ENGRO",
+    "engroh": "ENGROH", "engro holdings": "ENGROH",
+    "ffc": "FFC", "fauji fertilizer": "FFC",
+    "ffbl": "FFBL", "fauji fertilizer bin qasim": "FFBL",
+    "efert": "EFERT", "engro fertilizers": "EFERT",
+    "fatima": "FATIMA", "fatima fertilizer": "FATIMA",
+    "dawh": "DAWH", "dawood hercules": "DAWH",
+    # Cement
+    "luck": "LUCK", "lucky cement": "LUCK",
+    "dgkc": "DGKC", "dg khan cement": "DGKC",
+    "mlcf": "MLCF", "maple leaf cement": "MLCF",
+    "pioc": "PIOC", "pioneer cement": "PIOC",
+    "acpl": "ACPL", "attock cement": "ACPL",
+    "chcc": "CHCC", "cherat cement": "CHCC",
+    "fccl": "FCCL", "fauji cement": "FCCL",
+    "kohc": "KOHC", "kohat cement": "KOHC",
+    # Autos
     "psmc": "PSMC", "pak suzuki": "PSMC",
     "indu": "INDU", "indus motor": "INDU",
-    "atrl": "ATRL", "attock refinery": "ATRL",
+    "hcar": "HCAR", "honda atlas": "HCAR",
+    "sazew": "SAZEW", "sazgar": "SAZEW",
+    # Telecom
+    "ptcl": "PTC", "pakistan telecom": "PTC",
+    "trg": "TRG", "trg pakistan": "TRG",
+    "wtl": "WTL", "worldcall": "WTL",
+    # Consumer / Food
+    "nestle": "NESTLE", "nestle pakistan": "NESTLE",
+    "unity": "UNITY", "unity foods": "UNITY",
+    "colg": "COLG", "colgate palmolive": "COLG",
+    "ffl": "FFL", "fauji foods": "FFL",
+    # Textiles
+    "nml": "NML", "nishat mills": "NML",
+    "ncl": "NCL", "nishat chunian": "NCL",
+    "ktml": "KTML", "kohinoor textile": "KTML",
+    # Tech / Other
+    "avnc": "AVNC", "avanceon": "AVNC",
+    "srvi": "SRVI", "services limited": "SRVI",
 }
 
+
+def _resolve_symbol(query: str) -> str:
+    """Resolve company name or symbol to PSX ticker. Exact match first, then whole-word match."""
+    q = query.lower().strip()
+    if q in _PSX_NAME_MAP:
+        return _PSX_NAME_MAP[q]
+    for key, sym in _PSX_NAME_MAP.items():
+        # Only match on whole words to avoid 'engro' matching 'engroh'
+        if re.search(r'\b' + re.escape(key) + r'\b', q):
+            return sym
+        if re.search(r'\b' + re.escape(q) + r'\b', key):
+            return sym
+    return query.upper()
+
+
+# ── Data fetchers ─────────────────────────────────────────────────────────────
 
 async def _yf_fetch(symbol: str) -> dict:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -53,9 +116,9 @@ async def _yf_summary(symbol: str) -> dict:
         return resp.json()
 
 
-async def get_stock_price(symbol: str) -> dict:
-    """Get current live stock price for a PSX listed company."""
-    ticker = f"{symbol.upper()}.KA"
+async def _yf_price(symbol: str) -> dict | None:
+    """Fetch price from Yahoo Finance. Returns None on failure."""
+    ticker = f"{symbol}.KA"
     try:
         data = await _yf_fetch(ticker)
         result = data["chart"]["result"][0]
@@ -65,17 +128,46 @@ async def get_stock_price(symbol: str) -> dict:
         change = round(current - prev, 2)
         change_pct = round((change / prev) * 100, 2) if prev else 0.0
         return {
-            "symbol": symbol.upper(),
-            "company_name": meta.get("longName", symbol.upper()),
+            "symbol": symbol,
+            "company_name": meta.get("longName", symbol),
             "current_price_pkr": current,
             "previous_close_pkr": prev,
             "change_pkr": change,
             "change_percent": change_pct,
             "currency": meta.get("currency", "PKR"),
+            "source": "Yahoo Finance",
         }
     except Exception as exc:
-        logger.error("get_stock_price(%s): %s", symbol, exc)
-        return {"error": f"Could not fetch price for '{symbol}'. Verify the PSX symbol (e.g. OGDC, HBL, PSO)."}
+        logger.warning("YF price failed for %s: %s", symbol, exc)
+        return None
+
+
+# ── Public tools ──────────────────────────────────────────────────────────────
+
+async def get_stock_price_by_query(query: str) -> dict:
+    """Get live PSX stock price for any company name or symbol with automatic fallback."""
+    symbol = _resolve_symbol(query)
+    logger.info("get_stock_price_by_query: query=%s resolved=%s", query, symbol)
+
+    # 1. Try Yahoo Finance
+    result = await _yf_price(symbol)
+    if result:
+        return result
+
+    # 2. Fallback: targeted web search
+    logger.info("YF failed for %s — using web search fallback", symbol)
+    search = await web_search(
+        f"{symbol} share price PSX Pakistan today {_CURRENT_YEAR}",
+        max_results=4,
+    )
+    if "results" in search:
+        return {
+            "symbol": symbol,
+            "source": "web_search",
+            "note": f"Live API data unavailable for {symbol}. Latest info from web:",
+            "results": search["results"],
+        }
+    return {"error": f"Could not fetch price for '{query}' ({symbol}). The stock may not be listed or market is closed."}
 
 
 async def get_kse100_index() -> dict:
@@ -97,18 +189,22 @@ async def get_kse100_index() -> dict:
                 "previous_close": prev,
                 "change": change,
                 "change_percent": change_pct,
+                "source": "Yahoo Finance",
             }
         except Exception as exc:
             logger.warning("get_kse100_index(%s): %s", symbol, exc)
-    return {
-        "error": "KSE-100 index live data is currently unavailable. "
-                 "Please check https://dps.psx.com.pk for the latest index value."
-    }
+
+    # Fallback to web search
+    search = await web_search(f"KSE-100 index value today Pakistan {_CURRENT_YEAR}", max_results=3)
+    if "results" in search:
+        return {"index": "KSE-100", "source": "web_search", "results": search["results"]}
+    return {"error": "KSE-100 data unavailable. Check https://dps.psx.com.pk"}
 
 
-async def get_company_info(symbol: str) -> dict:
-    """Get detailed company info including market cap, P/E, 52-week range."""
-    ticker = f"{symbol.upper()}.KA"
+async def get_company_info(query: str) -> dict:
+    """Get company fundamentals: market cap, P/E ratio, 52-week range, dividend yield."""
+    symbol = _resolve_symbol(query)
+    ticker = f"{symbol}.KA"
     try:
         data = await _yf_summary(ticker)
         modules = data["quoteSummary"]["result"][0]
@@ -123,7 +219,7 @@ async def get_company_info(symbol: str) -> dict:
             return v if v is not None else "N/A"
 
         return {
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "sector": ap.get("sector", "N/A"),
             "industry": ap.get("industry", "N/A"),
             "market_cap_pkr": val(sd, "marketCap"),
@@ -132,56 +228,28 @@ async def get_company_info(symbol: str) -> dict:
             "52_week_high_pkr": val(sd, "fiftyTwoWeekHigh"),
             "52_week_low_pkr": val(sd, "fiftyTwoWeekLow"),
             "dividend_yield": val(sd, "dividendYield"),
-            "currency": "PKR",
+            "source": "Yahoo Finance",
         }
     except Exception as exc:
-        logger.error("get_company_info(%s): %s", symbol, exc)
-        return {"error": f"Could not fetch company info for '{symbol}': {exc}"}
+        logger.warning("get_company_info YF failed for %s: %s", symbol, exc)
 
-
-def _resolve_symbol(query: str) -> str:
-    """Resolve a company name or symbol string to a PSX ticker. Returns the ticker (may still be wrong if unknown)."""
-    q = query.lower().strip()
-    if q in _PSX_NAME_MAP:
-        return _PSX_NAME_MAP[q]
-    for key, sym in _PSX_NAME_MAP.items():
-        if key in q or q in key:
-            return sym
-    return query.upper()
-
-
-async def search_psx_symbol(company_name: str) -> dict:
-    """Find a PSX stock symbol from a company name."""
-    symbol = _resolve_symbol(company_name)
-    ticker = f"{symbol}.KA"
-    try:
-        data = await _yf_fetch(ticker)
-        if data["chart"]["result"]:
-            return {"symbol": symbol, "note": "Symbol resolved"}
-    except Exception:
-        pass
-    return {
-        "error": f"Could not find a PSX symbol for '{company_name}'. "
-                 "Try the stock symbol directly (e.g. OGDC, HBL, PSO, MCB, LUCK)."
-    }
-
-
-async def get_stock_price_by_query(query: str) -> dict:
-    """Get current PSX stock price from any company name or symbol. Handles resolution and fallback automatically."""
-    symbol = _resolve_symbol(query)
-    result = await get_stock_price(symbol)
-    if "error" not in result:
-        return result
-    # Yahoo Finance failed — fall back to web search
-    logger.warning("YF failed for %s, falling back to web_search", symbol)
-    search = await web_search(f"{query} PSX stock price today PKR")
+    # Fallback to web search
+    search = await web_search(
+        f"{symbol} PSX company fundamentals market cap PE ratio dividend {_CURRENT_YEAR}",
+        max_results=4,
+    )
     if "results" in search:
-        return {"symbol": symbol, "note": "Live API unavailable. Web search result below.", **search}
-    return {"error": f"Could not fetch price for '{query}'. Market may be closed or symbol not listed on Yahoo Finance."}
+        return {
+            "symbol": symbol,
+            "source": "web_search",
+            "note": f"Fundamentals API unavailable for {symbol}. Latest info from web:",
+            "results": search["results"],
+        }
+    return {"error": f"Could not fetch company info for '{query}' ({symbol})."}
 
 
 async def web_search(query: str, max_results: int = 4) -> dict:
-    """Search the web for current PSX information, account procedures, dividends, regulations, etc."""
+    """Search the web for PSX information: account opening, dividends, regulations, news, prices."""
     try:
         from duckduckgo_search import DDGS
 
@@ -204,7 +272,7 @@ async def web_search(query: str, max_results: int = 4) -> dict:
         return {"error": f"Web search failed: {exc}"}
 
 
-# ── Gemini tool declarations ──────────────────────────────────────────────────
+# ── Tool declarations ─────────────────────────────────────────────────────────
 
 GEMINI_TOOLS = [
     {
@@ -213,57 +281,47 @@ GEMINI_TOOLS = [
                 "name": "get_stock_price_by_query",
                 "description": (
                     "Get the current live PSX stock price for any company name or symbol. "
-                    "Pass EXACTLY what the user said — e.g. 'engroh', 'habib bank', 'OGDC', 'lucky cement'. "
-                    "This tool handles all symbol resolution and fallback automatically."
+                    "Pass EXACTLY what the user typed — e.g. 'engroh', 'habib bank', 'OGDC', 'lucky cement'. "
+                    "Handles symbol resolution, Yahoo Finance, and web search fallback automatically."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Exact company name or symbol as the user typed it"}
+                        "query": {"type": "string", "description": "Company name or symbol as user typed it"}
                     },
                     "required": ["query"],
                 },
             },
             {
                 "name": "get_kse100_index",
-                "description": (
-                    "Get the current live value of the KSE-100 index. "
-                    "Use when asked about the market index, KSE-100, or overall market performance today."
-                ),
+                "description": "Get the current live KSE-100 index value. Use for market index, overall market performance questions.",
                 "parameters": {"type": "object", "properties": {}},
             },
             {
                 "name": "get_company_info",
                 "description": (
-                    "Get detailed company fundamentals: market cap, P/E ratio, 52-week high/low, "
-                    "sector and dividend yield. Pass the PSX symbol e.g. OGDC, HBL, ENGRO, ENGROH."
+                    "Get company fundamentals: market cap, P/E ratio, EPS, 52-week range, dividend yield, sector. "
+                    "Pass the company name or symbol — e.g. 'OGDC', 'engro', 'lucky cement'."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL, ENGROH"}
+                        "query": {"type": "string", "description": "Company name or PSX symbol"}
                     },
-                    "required": ["symbol"],
+                    "required": ["query"],
                 },
             },
             {
                 "name": "web_search",
                 "description": (
-                    "Search the web for current PSX-related information. Use for: "
-                    "how to open a PSX/CDC account, account opening requirements, dividend announcements, "
-                    "trade signals, SECP regulations, broker information, or any PSX topic not covered by other tools."
+                    "Search the web for any PSX topic: account opening, dividends, regulations, broker info, "
+                    "market news, trade signals, or any question not answerable by other tools."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query, e.g. 'how to open PSX account Pakistan 2024'"
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Number of results to return (default 4)"
-                        }
+                        "query": {"type": "string", "description": "Search query"},
+                        "max_results": {"type": "integer", "description": "Results to return (default 4)"},
                     },
                     "required": ["query"],
                 },
@@ -272,8 +330,6 @@ GEMINI_TOOLS = [
     }
 ]
 
-# ── OpenAI tool declarations ──────────────────────────────────────────────────
-
 OPENAI_TOOLS = [
     {
         "type": "function",
@@ -281,13 +337,13 @@ OPENAI_TOOLS = [
             "name": "get_stock_price_by_query",
             "description": (
                 "Get the current live PSX stock price for any company name or symbol. "
-                "Pass EXACTLY what the user said — e.g. 'engroh', 'habib bank', 'OGDC', 'lucky cement'. "
-                "This tool handles all symbol resolution and fallback automatically."
+                "Pass EXACTLY what the user typed — e.g. 'engroh', 'habib bank', 'OGDC', 'lucky cement'. "
+                "Handles symbol resolution, Yahoo Finance, and web search fallback automatically."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Exact company name or symbol as the user typed it"}
+                    "query": {"type": "string", "description": "Company name or symbol as user typed it"}
                 },
                 "required": ["query"],
             },
@@ -297,7 +353,7 @@ OPENAI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_kse100_index",
-            "description": "Get the current live value of the KSE-100 index.",
+            "description": "Get the current live KSE-100 index value. Use for market index or overall market performance questions.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -305,13 +361,16 @@ OPENAI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_company_info",
-            "description": "Get detailed company fundamentals: market cap, P/E ratio, 52-week high/low, dividend yield. Pass the PSX symbol.",
+            "description": (
+                "Get company fundamentals: market cap, P/E ratio, EPS, 52-week range, dividend yield, sector. "
+                "Pass the company name or symbol — e.g. 'OGDC', 'engro', 'lucky cement'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "PSX stock symbol e.g. OGDC, PSO, HBL, ENGROH"}
+                    "query": {"type": "string", "description": "Company name or PSX symbol"}
                 },
-                "required": ["symbol"],
+                "required": ["query"],
             },
         },
     },
@@ -320,21 +379,14 @@ OPENAI_TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web for current PSX-related information. Use for: "
-                "how to open a PSX/CDC account, account opening requirements, dividend announcements, "
-                "trade signals, SECP regulations, broker information, or any PSX topic not covered by other tools."
+                "Search the web for any PSX topic: account opening, dividends, regulations, broker info, "
+                "market news, trade signals, or any question not answerable by other tools."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query e.g. 'how to open PSX trading account Pakistan 2024'"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Number of results (default 4)"
-                    }
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Results to return (default 4)"},
                 },
                 "required": ["query"],
             },
