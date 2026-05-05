@@ -145,44 +145,104 @@ async def _yf_price(symbol: str) -> dict | None:
         return None
 
 
-async def _psx_portal_price(symbol: str) -> dict | None:
-    """Fetch live price from PSX data portal (dps.psx.com.pk) for stocks not on Yahoo Finance."""
+async def _psx_live_price(symbol: str) -> dict | None:
+    """
+    Fetch live price from psx.com.pk and dps.psx.com.pk.
+    Tries JSON API endpoints first, then falls back to HTML parsing.
+    """
     import re as _re
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    urls = [
-        f"https://dps.psx.com.pk/company/{symbol.upper()}",
-        f"https://scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={symbol.upper()}",
+    sym = symbol.upper()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/html, */*",
+        "Referer": "https://www.psx.com.pk/",
+        "Origin": "https://www.psx.com.pk",
+    }
+
+    # ── 1. Try PSX JSON API endpoints ─────────────────────────────────────────
+    json_endpoints = [
+        f"https://dps.psx.com.pk/quotes?company={sym}",
+        f"https://dps.psx.com.pk/company/{sym}/json",
+        f"https://www.psx.com.pk/api/equity/snapshot?symbol={sym}",
+        f"https://www.psx.com.pk/data/equity/{sym}",
     ]
-    price_patterns = [
+    json_price_keys = ["currentPrice", "ldcp", "LDCP", "close", "lastSale", "price", "ltp", "last"]
+
+    for url in json_endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=8.0, verify=False, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    continue
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct:
+                    data = resp.json()
+                    # Handle list or dict response
+                    item = data[0] if isinstance(data, list) and data else data
+                    if isinstance(item, dict):
+                        for key in json_price_keys:
+                            val = item.get(key) or item.get(key.lower())
+                            if val is not None:
+                                try:
+                                    price = float(str(val).replace(",", ""))
+                                    if 1.0 < price < 200_000:
+                                        prev = float(str(item.get("previousClose") or item.get("prev") or price).replace(",", ""))
+                                        change = round(price - prev, 2)
+                                        pct = round((change / prev) * 100, 2) if prev else 0.0
+                                        logger.info("PSX JSON price for %s: %.2f (url=%s)", sym, price, url)
+                                        return {
+                                            "symbol": sym,
+                                            "company_name": item.get("companyName") or item.get("name") or sym,
+                                            "current_price_pkr": round(price, 2),
+                                            "previous_close_pkr": round(prev, 2),
+                                            "change_pkr": change,
+                                            "change_percent": pct,
+                                            "source": "PSX Live (psx.com.pk)",
+                                        }
+                                except (ValueError, TypeError):
+                                    pass
+        except Exception as exc:
+            logger.debug("PSX JSON endpoint failed %s: %s", url, exc)
+
+    # ── 2. Try HTML page parsing ───────────────────────────────────────────────
+    html_urls = [
+        f"https://dps.psx.com.pk/company/{sym}",
+        f"https://scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
+        f"https://www.psx.com.pk/market-summary/equity/{sym}",
+    ]
+    html_patterns = [
         r'"ldcp"\s*:\s*"?([\d.]+)"?',
         r'"currentPrice"\s*:\s*"?([\d.]+)"?',
         r'"close"\s*:\s*"?([\d.]+)"?',
-        r'"lastSale"\s*:\s*"?([\d.]+)"?',
-        r'"price"\s*:\s*"?([\d.]+)"?',
-        r'LDCP[^>]*>\s*([\d,]+\.?\d*)',
-        r'Last\s+(?:Sale|Price)[^>]*>\s*([\d,]+\.?\d*)',
+        r'"ltp"\s*:\s*"?([\d.]+)"?',
+        r'"last"\s*:\s*"?([\d.]+)"?',
+        r'LDCP[^<>]{0,30}>([\d,]+\.?\d*)',
+        r'Current Price[^<>]{0,30}>([\d,]+\.?\d*)',
+        r'Last Sale[^<>]{0,30}>([\d,]+\.?\d*)',
+        r'data-value="([\d.]+)"',
     ]
-    for url in urls:
+    for url in html_urls:
         try:
             async with httpx.AsyncClient(timeout=10.0, verify=False, headers=headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     continue
                 text = resp.text
-                for pattern in price_patterns:
+                for pattern in html_patterns:
                     m = _re.search(pattern, text, _re.IGNORECASE)
                     if m:
                         raw = m.group(1).replace(",", "")
                         price = float(raw)
                         if 1.0 < price < 200_000:
-                            logger.info("PSX portal price for %s: %.2f (url=%s)", symbol, price, url)
+                            logger.info("PSX HTML price for %s: %.2f (url=%s)", sym, price, url)
                             return {
-                                "symbol": symbol.upper(),
+                                "symbol": sym,
                                 "current_price_pkr": price,
-                                "source": "PSX Data Portal",
+                                "source": "PSX Website",
                             }
         except Exception as exc:
-            logger.warning("PSX portal fetch failed for %s (%s): %s", symbol, url, exc)
+            logger.warning("PSX HTML fetch failed for %s (%s): %s", sym, url, exc)
+
     return None
 
 
@@ -198,9 +258,9 @@ async def get_stock_price_by_query(query: str) -> dict:
     if result:
         return result
 
-    # 2. Try PSX data portal (covers stocks not on Yahoo Finance)
-    logger.info("YF failed for %s — trying PSX portal", symbol)
-    result = await _psx_portal_price(symbol)
+    # 2. Try PSX live (psx.com.pk + dps.psx.com.pk) for stocks not on Yahoo Finance
+    logger.info("YF failed for %s — trying PSX live", symbol)
+    result = await _psx_live_price(symbol)
     if result:
         return result
 
@@ -244,7 +304,20 @@ async def get_kse100_index() -> dict:
         except Exception as exc:
             logger.warning("get_kse100_index(%s): %s", symbol, exc)
 
-    # Fallback to web search
+    # Fallback: try PSX website for index
+    try:
+        import re as _re
+        _headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers=_headers) as client:
+            resp = await client.get("https://dps.psx.com.pk/")
+            if resp.status_code == 200:
+                m = _re.search(r'KSE.?100[^>]*>\s*([\d,]+\.?\d*)', resp.text, _re.IGNORECASE)
+                if m:
+                    value = float(m.group(1).replace(",", ""))
+                    if value > 10000:
+                        return {"index": "KSE-100", "current_value": value, "source": "PSX Website"}
+    except Exception:
+        pass
     search = await web_search(f"KSE-100 index value today Pakistan {_CURRENT_YEAR}", max_results=3)
     if "results" in search:
         return {"index": "KSE-100", "source": "web_search", "results": search["results"]}
