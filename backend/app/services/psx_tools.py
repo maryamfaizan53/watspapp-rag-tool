@@ -249,25 +249,25 @@ async def _psx_live_price(symbol: str) -> dict | None:
 # ── Public tools ──────────────────────────────────────────────────────────────
 
 async def get_stock_price_by_query(query: str) -> dict:
-    """Get live PSX stock price for any company name or symbol with automatic fallback."""
+    """Get live PSX stock price. Tries PSX direct first (most accurate), then Yahoo Finance, then web search."""
     symbol = _resolve_symbol(query)
     logger.info("get_stock_price_by_query: query=%s resolved=%s", query, symbol)
 
-    # 1. Try Yahoo Finance
-    result = await _yf_price(symbol)
-    if result:
-        return result
-
-    # 2. Try PSX live (psx.com.pk + dps.psx.com.pk) for stocks not on Yahoo Finance
-    logger.info("YF failed for %s — trying PSX live", symbol)
+    # 1. PSX live — primary source (psx.com.pk owns the data, always most accurate)
     result = await _psx_live_price(symbol)
     if result:
         return result
+    logger.info("PSX live failed for %s — trying Yahoo Finance", symbol)
 
-    # 3. Fallback: web search
-    logger.info("PSX portal failed for %s — using web search", symbol)
+    # 2. Yahoo Finance — secondary (may have stale or adjusted prices for some stocks)
+    result = await _yf_price(symbol)
+    if result:
+        return result
+    logger.info("YF also failed for %s — using web search", symbol)
+
+    # 3. Web search — final fallback
     search = await web_search(
-        f"{symbol} PSX share price Pakistan closing price {_CURRENT_YEAR}",
+        f"{symbol} PSX share price Pakistan today {_CURRENT_YEAR}",
         max_results=4,
     )
     if "results" in search:
