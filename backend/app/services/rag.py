@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -9,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import faiss_store
 from app.db.models import Conversation, Message, DocumentChunk
 from app.services import embeddings, llm
-from app.services.psx_tools import ALL_TOOLS, _resolve_symbol, get_stock_price_by_query as _fetch_price, _KNOWN_PSX_SYMBOLS
+from app.services.psx_tools import ALL_TOOLS, _PSX_NAME_MAP, get_stock_price_by_query as _fetch_price
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ Conversation history:
 
 User question: {question}
 
-Answer using the LIVE STOCK DATA above. Be direct: state the company name, current price in PKR, change, and percent change. If web search results are shown instead of a price, extract and summarise the price information from them.
+Answer using ONLY the LIVE STOCK DATA above. For each company: state its name, symbol, current price in PKR, change, and percent change. List all companies clearly. If web search results appear instead of a structured price, extract the price from the text. Do not guess or add companies not in the data.
 
 Answer:"""
 
@@ -64,22 +66,44 @@ User question: {question}
 Answer:"""
 
 
+def _extract_all_symbols(query_text: str) -> list[str]:
+    """
+    Scan the full query and return ALL matching PSX symbols (deduplicated, order-preserving).
+    Uses exact match first, then whole-word regex — same logic as _resolve_symbol but for ALL matches.
+    """
+    q = query_text.lower()
+    found: dict[str, bool] = {}  # symbol → seen (ordered dict behaviour in py3.7+)
+
+    # Exact match pass
+    for key, sym in _PSX_NAME_MAP.items():
+        if re.search(r'\b' + re.escape(key) + r'\b', q):
+            found[sym] = True
+
+    return list(found.keys())
+
+
 async def _prefetch_stock_data(query_text: str) -> str:
     """
-    Detect a known PSX company in the query and pre-fetch its price in Python.
-    Returns a string with the data, or "" if no known stock was found.
-    Uses full fallback chain: Yahoo Finance → PSX portal → web search.
+    Find ALL PSX companies mentioned in the query and pre-fetch their prices in parallel.
+    Returns a multi-company JSON string, or "" if no known stocks found.
     Bypasses the LLM's tendency to 'correct' company names before tool calls.
     """
-    resolved = _resolve_symbol(query_text)
-    if resolved not in _KNOWN_PSX_SYMBOLS:
+    symbols = _extract_all_symbols(query_text)
+    if not symbols:
         return ""
 
-    logger.info("Pre-fetching price for %s (from query: %s)", resolved, query_text)
-    result = await _fetch_price(query_text)
-    if "error" not in result:
-        return json.dumps(result, indent=2)
-    return ""
+    logger.info("Pre-fetching prices for: %s", symbols)
+    tasks = [_fetch_price(sym) for sym in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    data_parts = []
+    for sym, result in zip(symbols, results):
+        if isinstance(result, Exception):
+            logger.warning("Pre-fetch error for %s: %s", sym, result)
+        elif isinstance(result, dict) and "error" not in result:
+            data_parts.append(json.dumps(result, indent=2))
+
+    return "\n---\n".join(data_parts) if data_parts else ""
 
 
 async def get_or_create_conversation(
