@@ -242,6 +242,15 @@ async def _psx_live_price(symbol: str) -> dict | None:
             logger.debug("PSX JSON endpoint failed %s: %s", url, exc)
 
     # ── 3. HTML scraping: PSX portal + broker sites (globally accessible) ─────
+    _scs_patterns = [
+        r'id="[^"]*lblCurrentPrice[^"]*"[^>]*>([\d,]+\.?\d*)',  # ASP.NET label ID
+        r'id="[^"]*lblLastSale[^"]*"[^>]*>([\d,]+\.?\d*)',
+        r'Current Price[^<>]{0,40}>([\d,]+\.?\d*)',
+        r'Last Sale[^<>]{0,40}>([\d,]+\.?\d*)',
+        r'LDCP[^<>]{0,40}>([\d,]+\.?\d*)',
+        r'(?:price|close)["\s:>]{1,10}([\d,]{2,7}\.\d{2})',
+        r'<td[^>]*>\s*([\d,]{2,7}\.\d{2})\s*</td>',
+    ]
     html_sources = [
         (
             f"https://dps.psx.com.pk/company/{sym}",
@@ -254,18 +263,22 @@ async def _psx_live_price(symbol: str) -> dict | None:
                 r'LDCP[^<>]{0,30}>([\d,]+\.?\d*)',
             ],
         ),
+        # SCS Trade (scstrade.com / scs.com.pk) — Pakistani broker with live PSX quotes
+        (
+            f"https://www.scs.com.pk/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
+            _scs_patterns,
+        ),
+        (
+            f"https://scs.com.pk/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
+            _scs_patterns,
+        ),
         (
             f"https://scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
-            [
-                r'Current Price[^<>]{0,30}>([\d,]+\.?\d*)',
-                r'Last Sale[^<>]{0,30}>([\d,]+\.?\d*)',
-                r'id="lblCurrentPrice"[^>]*>([\d,]+\.?\d*)',
-                r'([\d,]+\.\d{2})</span>',
-            ],
+            _scs_patterns,
         ),
         (
             f"https://www.scstrade.com/stockscreening/SS_CompanySnapShot.aspx?symbol={sym}",
-            [r'([\d,]+\.\d{2})'],
+            _scs_patterns,
         ),
     ]
     for url, patterns in html_sources:
