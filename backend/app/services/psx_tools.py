@@ -17,6 +17,7 @@ _PSX_NAME_MAP = {
     "ubl": "UBL", "united bank": "UBL",
     "luck": "LUCK", "lucky cement": "LUCK",
     "engro": "ENGRO", "engro corporation": "ENGRO",
+    "engroh": "ENGROH", "engro holdings": "ENGROH",
     "ppl": "PPL", "pakistan petroleum": "PPL",
     "bafl": "BAFL", "bank alfalah": "BAFL",
     "ffc": "FFC", "fauji fertilizer": "FFC",
@@ -141,6 +142,9 @@ async def get_company_info(symbol: str) -> dict:
 async def search_psx_symbol(company_name: str) -> dict:
     """Find a PSX stock symbol from a company name."""
     query = company_name.lower().strip()
+    # Exact match first to avoid substring collisions (e.g. "engro" matching "engroh")
+    if query in _PSX_NAME_MAP:
+        return {"symbol": _PSX_NAME_MAP[query], "matched_name": query.title()}
     for key, symbol in _PSX_NAME_MAP.items():
         if key in query or query in key:
             return {"symbol": symbol, "matched_name": key.title()}
