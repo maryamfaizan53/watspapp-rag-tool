@@ -66,6 +66,38 @@ User question: {question}
 Answer:"""
 
 
+def _format_price_direct(live_data: str) -> str | None:
+    """Format pre-fetched price data in Python when LLM is unavailable."""
+    lines = []
+    for block in live_data.split("\n---\n"):
+        block = block.strip()
+        if not block:
+            continue
+        try:
+            d = json.loads(block)
+            sym = d.get("symbol", "")
+            name = d.get("company_name", sym)
+            price = d.get("current_price_pkr")
+            change = d.get("change_pkr")
+            pct = d.get("change_percent")
+            source = d.get("source", "")
+            if price is None:
+                continue
+            arrow = "▲" if (change or 0) >= 0 else "▼"
+            line = f"*{name} ({sym})*\nPrice: PKR {price}"
+            if change is not None and pct is not None:
+                line += f"\nChange: {arrow} PKR {abs(change)} ({abs(pct)}%)"
+            if source:
+                line += f"\n_Source: {source}_"
+            lines.append(line)
+        except Exception:
+            pass
+    if not lines:
+        return None
+    header = "Latest PSX price:\n\n" if len(lines) == 1 else "Latest PSX prices:\n\n"
+    return header + "\n\n".join(lines)
+
+
 def _extract_all_symbols(query_text: str) -> list[str]:
     """
     Scan the full query and return ALL matching PSX symbols (deduplicated, order-preserving).
@@ -235,6 +267,9 @@ async def answer_query(
             live_data=live_data, context=context, history=history, question=query_text
         )
         answer = await llm.safe_generate(prompt)
+        if answer is None:
+            # LLM is down but we have the price data — format it directly in Python
+            answer = _format_price_direct(live_data)
     else:
         # Unknown stock or non-stock query — let LLM pick the right tool
         prompt = _PROMPT_WITH_TOOLS.format(

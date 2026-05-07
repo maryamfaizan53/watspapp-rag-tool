@@ -11,8 +11,9 @@ class LLMUnavailableError(Exception):
     """Raised when the LLM circuit breaker is OPEN or the request times out."""
 
 
-# Circuit breaker: 5 failures → OPEN for 20 seconds
-_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=20)
+# Separate breakers so tool-call failures don't kill simple text generation
+_breaker = pybreaker.CircuitBreaker(fail_max=10, reset_timeout=60)
+_tool_breaker = pybreaker.CircuitBreaker(fail_max=10, reset_timeout=60)
 
 
 async def _generate_ollama(prompt: str) -> str:
@@ -178,7 +179,7 @@ async def generate(prompt: str) -> str:
         raise
 
 
-@_breaker
+@_tool_breaker
 async def generate_with_tools(prompt: str, tools: dict, force_tool: bool = True) -> str:
     """Send a prompt with tool support. tools must be {'gemini': [...], 'openai': [...]}."""
     provider = settings.llm_provider.lower()
@@ -245,7 +246,7 @@ async def safe_generate_with_tools(prompt: str, tools: dict, force_tool: bool = 
     try:
         return await generate_with_tools(prompt, tools, force_tool=force_tool)
     except pybreaker.CircuitBreakerError:
-        logger.warning("LLM circuit breaker OPEN — trying fallback provider")
+        logger.warning("LLM tool circuit breaker OPEN — trying fallback provider")
         return await _get_fallback(prompt)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 429:
