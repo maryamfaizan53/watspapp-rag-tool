@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import httpx
@@ -206,23 +207,41 @@ async def _get_fallback(prompt: str) -> str | None:
     if provider == "openai":
         if not settings.gemini_api_key:
             return None
-        try:
-            result = await _generate_gemini(prompt)
-            logger.info("Gemini fallback succeeded")
-            return result
-        except Exception as exc:
-            logger.error("Gemini fallback failed: %s", exc)
-            return None
+        for attempt in range(2):
+            try:
+                result = await _generate_gemini(prompt)
+                logger.info("Gemini fallback succeeded")
+                return result
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt == 0:
+                    logger.warning("Gemini fallback also 429 — waiting 4s then retrying")
+                    await asyncio.sleep(4.0)
+                    continue
+                logger.error("Gemini fallback failed: %s", exc)
+                return None
+            except Exception as exc:
+                logger.error("Gemini fallback failed: %s", exc)
+                return None
+        return None
     else:
         if not settings.openai_api_key:
             return None
-        try:
-            result = await _generate_openai(prompt)
-            logger.info("OpenAI fallback succeeded")
-            return result
-        except Exception as exc:
-            logger.error("OpenAI fallback failed: %s", exc)
-            return None
+        for attempt in range(2):
+            try:
+                result = await _generate_openai(prompt)
+                logger.info("OpenAI fallback succeeded")
+                return result
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt == 0:
+                    logger.warning("OpenAI fallback also 429 — waiting 4s then retrying")
+                    await asyncio.sleep(4.0)
+                    continue
+                logger.error("OpenAI fallback failed: %s", exc)
+                return None
+            except Exception as exc:
+                logger.error("OpenAI fallback failed: %s", exc)
+                return None
+        return None
 
 
 async def safe_generate(prompt: str) -> str | None:
