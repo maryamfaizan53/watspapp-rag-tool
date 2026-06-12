@@ -1,185 +1,36 @@
+"""
+Health & diagnostics.
+
+SECURITY NOTE: the previous version of this module exposed ~10 unauthenticated
+/debug/* endpoints that could send real WhatsApp/Telegram messages on behalf
+of tenants, leak token prefixes and message content, and burn LLM quota.
+They have been removed. The single remaining diagnostic endpoint requires an
+authenticated admin AND is disabled entirely when ENVIRONMENT=production.
+"""
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
+
 from sqlalchemy import text
 
+from app.api.auth import get_current_admin
 from app.config import settings
 from app.db import faiss_store
 from app.db.postgres import AsyncSessionLocal
 from app.db.redis import get_redis
-from app.db.models import Tenant
+from app.db.models import AdminUser, Tenant
 from app.services import embeddings
 
 router = APIRouter(tags=["Health"])
 
 
-@router.get("/debug/whatsapp-send-trace")
-async def debug_whatsapp_send_trace() -> dict:
-    """Show pre-send, post-send, and send-error state from last WhatsApp background task."""
-    import json as _json
-    result = {}
-    try:
-        pre = await get_redis().get("debug:wa_pre_send")
-        ok = await get_redis().get("debug:wa_send_ok")
-        err = await get_redis().get("debug:wa_send_error")
-        result["pre_send"] = _json.loads(pre) if pre else None
-        result["send_ok"] = _json.loads(ok) if ok else None
-        result["send_error"] = _json.loads(err) if err else None
-    except Exception as e:
-        result["redis_error"] = str(e)
-    return result
-
-
-@router.get("/debug/whatsapp-parse-trace")
-async def debug_whatsapp_parse_trace() -> dict:
-    """Return trace of last time parse_webhook returned None."""
-    import json as _json
-    try:
-        val = await get_redis().get("debug:wa_parse_none")
-        if val:
-            return {"parse_returned_none": True, **_json.loads(val)}
-    except Exception as e:
-        return {"redis_error": str(e)}
-    return {"parse_returned_none": False, "message": "parse_webhook did not return None"}
-
-
-@router.get("/debug/reset-breaker")
-async def reset_circuit_breaker() -> dict:
-    """Reset the LLM circuit breaker to CLOSED state."""
-    from app.services.llm import _breaker
-    try:
-        _breaker.close()
-        return {"status": "reset", "state": str(_breaker.current_state)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@router.get("/debug/test-gemini")
-async def test_gemini_direct() -> dict:
-    """Test Gemini API directly — bypasses circuit breaker."""
-    import traceback
-    from app.services.llm import _generate_gemini
-    try:
-        answer = await _generate_gemini("Say hello in one sentence.")
-        return {"ok": True, "answer": answer}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()[-600:]}
-
-
-@router.get("/debug/test-openai")
-async def test_openai_direct() -> dict:
-    """Test OpenAI API directly — bypasses circuit breaker."""
-    import traceback
-    from app.services.llm import _generate_openai
-    try:
-        answer = await _generate_openai("Say hello in one sentence.")
-        return {"ok": True, "answer": answer}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()[-600:]}
-
-
-@router.get("/debug/whatsapp-last-error")
-async def debug_whatsapp_last_error() -> dict:
-    """Return the last error from the WhatsApp background task."""
-    import json as _json
-    try:
-        val = await get_redis().get("debug:last_wa_error")
-        if val:
-            return {"has_error": True, **_json.loads(val)}
-    except Exception as e:
-        return {"redis_error": str(e)}
-    return {"has_error": False, "message": "No errors recorded"}
-
-
-@router.get("/debug/whatsapp-last-webhook")
-async def debug_whatsapp_last_webhook() -> dict:
-    """Return the last WhatsApp webhook received (persisted in Redis)."""
-    import json as _json
-    from app.api.webhooks import _last_wa_webhook
-    # Try Redis first (survives restarts)
-    try:
-        val = await get_redis().get("debug:last_wa_webhook")
-        if val:
-            data = _json.loads(val)
-            return {"received": True, "source": "redis", **data}
-    except Exception:
-        pass
-    # Fall back to in-memory
-    if _last_wa_webhook:
-        return {"received": True, "source": "memory", **_last_wa_webhook}
-    return {"received": False, "message": "No WhatsApp webhook received since last restart"}
-
-
-@router.get("/debug/whatsapp-simulate/{tenant_id}/{from_number}")
-async def debug_whatsapp_simulate(tenant_id: str, from_number: str, text: str = "What is PSX?") -> dict:
-    """Simulate an incoming WhatsApp message and send a real reply."""
-    import traceback
-    from uuid import UUID
-    from app.services import rag, bot_user_service
-    from app.schemas.bot_user import Platform
-    from app.schemas.message import ContentType, MessageRole
-    from app.providers import whatsapp as wa
-    result: dict = {"from": from_number, "query": text}
-    try:
-        async with AsyncSessionLocal() as db:
-            from app.db.models import Tenant as T
-            tenant = await db.get(T, UUID(tenant_id))
-            if not tenant:
-                return {"error": "tenant not found"}
-            wa_cfg = (tenant.channels or {}).get("whatsapp", {})
-            access_token = wa_cfg.get("access_token")
-            phone_number_id = wa_cfg.get("phone_number_id")
-            result["credentials_ok"] = bool(access_token and phone_number_id)
-            if not access_token or not phone_number_id:
-                return result
-
-            bot_user = await bot_user_service.get_or_create_bot_user(
-                db, UUID(tenant_id), Platform.whatsapp, from_number
-            )
-            conversation = await rag.get_or_create_conversation(
-                db, UUID(tenant_id), bot_user.id, Platform.whatsapp.value
-            )
-            answer, chunk_ids = await rag.answer_query(db, UUID(tenant_id), conversation.id, text)
-            result["answer"] = answer[:300]
-            result["faiss_hits"] = len(chunk_ids)
-
-            await wa.send_text_reply(access_token, phone_number_id, from_number, answer)
-            result["sent"] = True
-    except Exception as e:
-        result["error"] = str(e)
-        result["traceback"] = traceback.format_exc()[-800:]
-    return result
-
-
-@router.get("/debug/whatsapp-send/{tenant_id}/{to_number}")
-async def debug_whatsapp_send(tenant_id: str, to_number: str) -> dict:
-    """Test WhatsApp send directly — bypasses webhook, sends a real message."""
-    import traceback
-    from uuid import UUID
-    from app.providers import whatsapp as wa
-    result: dict = {}
-    try:
-        async with AsyncSessionLocal() as db:
-            from app.db.models import Tenant as T
-            tenant = await db.get(T, UUID(tenant_id))
-            if not tenant:
-                return {"error": "tenant not found"}
-            wa_cfg = (tenant.channels or {}).get("whatsapp", {})
-            result["access_token_set"] = bool(wa_cfg.get("access_token"))
-            result["phone_number_id_set"] = bool(wa_cfg.get("phone_number_id"))
-            result["phone_number_id"] = wa_cfg.get("phone_number_id", "MISSING")
-            if not wa_cfg.get("access_token") or not wa_cfg.get("phone_number_id"):
-                return result
-            await wa.send_text_reply(
-                wa_cfg["access_token"],
-                wa_cfg["phone_number_id"],
-                to_number,
-                "✅ Test message from BotIQ — WhatsApp channel is working!",
-            )
-            result["sent"] = True
-    except Exception as e:
-        result["error"] = str(e)
-        result["traceback"] = traceback.format_exc()[-800:]
-    return result
+async def require_debug_access(
+    admin: AdminUser = Depends(get_current_admin),
+) -> AdminUser:
+    """Debug endpoints: admin-only, and never available in production."""
+    if settings.environment.lower() == "production":
+        # 404 (not 403) so production doesn't even reveal these routes exist
+        raise HTTPException(status_code=404, detail="Not found")
+    return admin
 
 
 @router.get("/health")
@@ -207,9 +58,10 @@ async def health_check() -> dict:
         if not settings.gemini_api_key or "your-gemini-api-key" in settings.gemini_api_key:
             deps["gemini"] = "missing_api_key"
         else:
-            # We don't want to burn tokens on health check, just check key exists for now
-            # Or do a minimal model check
+            # Don't burn tokens on health checks — just confirm a key exists
             deps["gemini"] = "configured"
+    elif provider == "openai":
+        deps["openai"] = "configured" if settings.openai_api_key else "missing_api_key"
 
     # Redis
     try:
@@ -223,137 +75,17 @@ async def health_check() -> dict:
     return {"status": overall, "version": "0.1.0", "dependencies": deps}
 
 
-@router.get("/debug/full-pipeline/{tenant_id}/{chat_id}")
-async def debug_full_pipeline(tenant_id: str, chat_id: str) -> dict:
-    """Run the full RAG pipeline inline and attempt Telegram reply. Returns every step."""
-    import traceback
-    from app.services import rag, llm
-    result: dict = {"steps": []}
-
-    try:
-        async with AsyncSessionLocal() as db:
-            tenant = await db.get(Tenant, tenant_id)
-            if not tenant:
-                return {"error": "tenant not found"}
-            bot_token = (tenant.channels or {}).get("telegram", {}).get("bot_token")
-            result["bot_token"] = "SET" if bot_token else "MISSING"
-            result["channels_raw_keys"] = list((tenant.channels or {}).get("telegram", {}).keys())
-            if not bot_token:
-                return result
-            result["steps"].append("got_bot_token")
-
-            vec = embeddings.embed_text("What is KSE-100?")
-            hits = faiss_store.search(tenant_id, vec, top_k=3)
-            result["faiss_hits"] = len(hits)
-            result["steps"].append("faiss_searched")
-
-            answer = await llm.safe_generate_with_tools(f"User asks: What is KSE-100? Context: PSX is Pakistan Stock Exchange.", [])
-            result["llm_answer"] = (answer or "")[:200]
-            result["steps"].append("llm_answered")
-
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": int(chat_id), "text": answer or "Test reply"},
-            )
-            result["telegram_status"] = resp.status_code
-            result["telegram_ok"] = resp.json().get("ok")
-            result["steps"].append("telegram_sent")
-
-    except Exception as e:
-        result["error"] = str(e)
-        result["traceback"] = traceback.format_exc()[-500:]
-
-    return result
-
-
-@router.get("/debug/send-test/{tenant_id}/{chat_id}")
-async def debug_send_test(tenant_id: str, chat_id: str) -> dict:
-    """Send a test Telegram reply directly — bypasses background task."""
-    import httpx
-    from app.db.models import Tenant
-    from app.services import embeddings
-    result: dict = {}
-    async with AsyncSessionLocal() as db:
-        tenant = await db.get(Tenant, tenant_id)
-        if not tenant:
-            return {"error": "tenant not found"}
-        bot_token = (tenant.channels or {}).get("telegram", {}).get("bot_token")
-        result["bot_token_present"] = bool(bot_token)
-        if not bot_token:
-            return result
-
-    # Test embed + faiss
-    try:
-        vec = embeddings.embed_text("What is PSX?")
-        hits = faiss_store.search(tenant_id, vec, top_k=3)
-        result["faiss_hits"] = len(hits)
-    except Exception as e:
-        result["faiss_error"] = str(e)
-        return result
-
-    # Send test message via Telegram
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"Test OK — FAISS hits: {len(hits)}"},
-            )
-            result["telegram_send"] = resp.status_code
-            result["telegram_response"] = resp.json()
-    except Exception as e:
-        result["telegram_error"] = str(e)
-
-    return result
-
-
-@router.get("/debug/telegram-reply/{tenant_id}")
-async def debug_telegram_reply(tenant_id: str, text: str = "What is PSX?") -> dict:
-    """Simulate an inline Telegram webhook message and return what the bot would reply."""
-    import traceback
-    from uuid import UUID
-    from app.services import rag, bot_user_service
-    from app.schemas.bot_user import Platform
-    from app.schemas.message import ContentType, MessageRole
-    result: dict = {"query": text}
-    try:
-        async with AsyncSessionLocal() as db:
-            from sqlalchemy import select
-            from app.db.models import Tenant as T
-            tid = UUID(tenant_id)
-            tenant = await db.get(T, tid)
-            if not tenant:
-                return {"error": "tenant not found"}
-            result["tenant_status"] = tenant.status
-
-            bot_user = await bot_user_service.get_or_create_bot_user(
-                db, tid, Platform.telegram, "debug_user"
-            )
-            result["bot_user_id"] = str(bot_user.id)
-
-            conversation = await rag.get_or_create_conversation(
-                db, tid, bot_user.id, Platform.telegram.value
-            )
-            result["conversation_id"] = str(conversation.id)
-
-            answer, chunk_ids = await rag.answer_query(db, tid, conversation.id, text)
-            result["answer"] = answer
-            result["chunk_ids"] = chunk_ids
-            result["webhook_response"] = {
-                "method": "sendMessage",
-                "chat_id": "<user_chat_id>",
-                "text": answer[:200]
-            }
-    except Exception as e:
-        result["error"] = str(e)
-        result["traceback"] = traceback.format_exc()[-1000:]
-    return result
-
-
 @router.get("/debug/pipeline/{tenant_id}")
-async def debug_pipeline(tenant_id: str) -> dict:
-    """Debug endpoint: tests embed + FAISS + channels for a tenant."""
+async def debug_pipeline(
+    tenant_id: str,
+    _: AdminUser = Depends(require_debug_access),
+) -> dict:
+    """
+    Admin-only, non-production: smoke-test embed + FAISS + channel config for a
+    tenant. Never returns secret values — only SET/MISSING flags.
+    """
     result: dict = {}
+    vec = None
     try:
         vec = embeddings.embed_text("test query about PSX")
         result["embed"] = f"ok (dim={len(vec)})"
@@ -361,20 +93,27 @@ async def debug_pipeline(tenant_id: str) -> dict:
         result["embed"] = f"FAILED: {e}"
 
     try:
-        hits = faiss_store.search(tenant_id, vec if "vec" in dir() else None, top_k=3)
-        result["faiss"] = f"ok ({len(hits)} hits)"
+        if vec is not None:
+            hits = faiss_store.search(tenant_id, vec, top_k=3)
+            result["faiss"] = f"ok ({len(hits)} hits)"
+        else:
+            result["faiss"] = "skipped (embed failed)"
     except Exception as e:
         result["faiss"] = f"FAILED: {e}"
 
     try:
+        from uuid import UUID
         async with AsyncSessionLocal() as db:
-            tenant = await db.get(Tenant, tenant_id)
+            tenant = await db.get(Tenant, UUID(tenant_id))
             if tenant:
                 ch = tenant.channels or {}
                 tg = ch.get("telegram", {})
                 wa = ch.get("whatsapp", {})
                 result["channels"] = {
                     "telegram_token": "SET" if tg.get("bot_token") else "MISSING",
+                    "telegram_webhook_secret": "SET" if tg.get("webhook_secret_token") else "MISSING",
+                    "whatsapp_access_token": "SET" if wa.get("access_token") else "MISSING",
+                    "whatsapp_app_secret": "SET" if wa.get("app_secret") else "MISSING",
                     "whatsapp_verify_token": "SET" if wa.get("verify_token") else "MISSING",
                 }
             else:

@@ -3,14 +3,12 @@ import time
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request, status
-from sqlalchemy import select, update
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
 
 from app.db import get_db, AsyncSessionLocal
-from app.db.models import Tenant, Message, BotUser, Conversation
+from app.db.models import Tenant, Message
 from app.schemas.bot_user import Platform
 from app.schemas.message import ContentType, MessageRole
 from app.providers import telegram as tg_provider
@@ -18,20 +16,22 @@ from app.providers.telegram import AudioTooLongError, UnsupportedMessageTypeErro
 from app.providers import whatsapp as wa_provider
 from app.providers.whatsapp import InvalidSignatureError
 from app.services import bot_user_service, rag
+from app.services.crypto import decrypt_secret
 from app.services.rate_limiter import limiter
 from app.services.transcription import TranscriptionError, transcribe_audio
+from app.services.usage_service import QUOTA_EXCEEDED_REPLY, consume_message_quota
 
 _MAX_TG_TEXT = 4096
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
-# In-memory tracker for last received WhatsApp webhook (debug only)
-_last_wa_webhook: dict = {}
-
 
 async def _get_tenant(db: AsyncSession, tenant_id: str | UUID) -> Tenant:
-    tid = UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+    try:
+        tid = UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Tenant not found or inactive")
     query = select(Tenant).where(Tenant.id == tid, Tenant.status == "active")
     result = await db.execute(query)
     tenant = result.scalar_one_or_none()
@@ -74,7 +74,7 @@ def _tg_reply(chat_id: str, text: str) -> dict:
     return {"method": "sendMessage", "chat_id": int(chat_id), "text": text[:_MAX_TG_TEXT]}
 
 
-# ── WhatsApp (Twilio) ─────────────────────────────────────────────────
+# ── WhatsApp (Meta Cloud API) ─────────────────────────────────────────
 
 
 async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
@@ -84,7 +84,7 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
             return
 
         wa_config = tenant.channels.get("whatsapp", {})
-        access_token = wa_config.get("access_token")
+        access_token = decrypt_secret(wa_config.get("access_token"))
         phone_number_id = wa_config.get("phone_number_id")
 
         if not all([access_token, phone_number_id]):
@@ -92,21 +92,34 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
             return
 
         msg = wa_provider.parse_webhook(payload)
-        if not msg or not msg.body.strip():
-            import json as _json
+        if not msg:
+            return
+
+        # Non-text messages (voice notes, images, stickers...) — reply politely
+        # instead of silently dropping. Keeps users from thinking the bot is dead.
+        if msg.unsupported:
             try:
-                from app.db.redis import get_redis
-                await get_redis().set("debug:wa_parse_none", _json.dumps({
-                    "payload_entry_keys": list((payload.get("entry", [{}])[0]).keys()),
-                    "changes": str(payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", "NO_MESSAGES"))[:300],
-                    "msg_was_none": msg is None,
-                    "body_empty": bool(msg) and not msg.body.strip(),
-                }), ex=3600)
+                await wa_provider.send_text_reply(
+                    access_token, phone_number_id, msg.from_number,
+                    "I can only read text messages on WhatsApp right now. "
+                    "Please type your question.",
+                )
             except Exception:
-                pass
+                logger.exception("Failed to send unsupported-type notice (tenant %s)", tenant_id)
+            return
+
+        if not msg.body.strip():
             return
 
         try:
+            # Quota gate BEFORE any LLM/embedding work — over-quota tenants
+            # must not burn tokens. Counter is row-locked and month-aware.
+            if not await consume_message_quota(db, tenant_id):
+                await wa_provider.send_text_reply(
+                    access_token, phone_number_id, msg.from_number, QUOTA_EXCEEDED_REPLY
+                )
+                return
+
             bot_user = await bot_user_service.get_or_create_bot_user(
                 db, tenant_id, Platform.whatsapp, msg.from_number
             )
@@ -131,47 +144,12 @@ async def _handle_whatsapp_message(payload: dict, tenant_id: UUID) -> None:
 
             await rag.update_conversation(db, conversation.id)
 
-            if tenant.usage is None:
-                tenant.usage = {"message_count_month": 0, "active_users_month": 0}
-            new_usage = tenant.usage.copy()
-            new_usage["message_count_month"] = new_usage.get("message_count_month", 0) + 1
-            tenant.usage = new_usage
-            await db.commit()
-
-            import json as _json
-            from app.db.redis import get_redis
-            await get_redis().set("debug:wa_pre_send", _json.dumps({
-                "from_number": msg.from_number,
-                "phone_number_id": phone_number_id,
-                "answer_preview": answer[:100],
-                "access_token_prefix": access_token[:12] + "...",
-            }), ex=3600)
-
-            # Isolated send with its own error capture
-            try:
-                await wa_provider.send_text_reply(access_token, phone_number_id, msg.from_number, answer)
-                await get_redis().set("debug:wa_send_ok", _json.dumps({"to": msg.from_number, "sent": True}), ex=3600)
-                await get_redis().delete("debug:wa_send_error")
-            except Exception as send_exc:
-                import traceback as _tb
-                logger.exception("WhatsApp send failed for tenant %s: %s", tenant_id, send_exc)
-                await get_redis().set("debug:wa_send_error", _json.dumps({
-                    "error": str(send_exc),
-                    "type": type(send_exc).__name__,
-                    "traceback": _tb.format_exc()[-1000:],
-                    "phone_number_id": phone_number_id,
-                    "to": msg.from_number,
-                }), ex=3600)
+            await wa_provider.send_text_reply(
+                access_token, phone_number_id, msg.from_number, answer
+            )
 
         except Exception as exc:
-            import traceback as _tb, json as _json
             logger.exception("Unhandled error in WhatsApp handler for tenant %s: %s", tenant_id, exc)
-            err_data = {"error": str(exc), "traceback": _tb.format_exc()[-1000:]}
-            try:
-                from app.db.redis import get_redis
-                await get_redis().set("debug:last_wa_error", _json.dumps(err_data), ex=3600)
-            except Exception:
-                pass
 
 
 @router.get("/whatsapp/{tenant_id}", status_code=200)
@@ -186,7 +164,7 @@ async def whatsapp_verify(
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
-    if mode == "subscribe" and token == verify_token:
+    if mode == "subscribe" and verify_token and token == verify_token:
         logger.info("WhatsApp webhook verified for tenant %s", tenant_id)
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse(challenge)
@@ -203,39 +181,33 @@ async def whatsapp_webhook(
 ) -> dict:
     tenant = await _get_tenant(db, tenant_id)
     wa_config = tenant.channels.get("whatsapp", {})
-    app_secret = wa_config.get("app_secret", "")
+    app_secret = decrypt_secret(wa_config.get("app_secret")) or ""
 
     body_bytes = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
 
-    # Track BEFORE signature check so we can see if Meta is calling us at all
-    import datetime as _dt, json as _json
-    global _last_wa_webhook
-    sig_valid: str = "skipped"
-    if app_secret and signature:
+    # SECURITY: when an app secret is configured the signature is MANDATORY.
+    # Meta signs every webhook delivery — a missing or invalid signature means
+    # the request did not come from Meta and must be rejected, otherwise anyone
+    # can forge payloads and make the bot message arbitrary numbers.
+    if app_secret:
+        if not signature:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing signature")
         try:
             wa_provider.verify_signature(app_secret, body_bytes, signature)
-            sig_valid = "ok"
         except InvalidSignatureError:
-            sig_valid = "failed"
-            logger.warning("WhatsApp signature verification failed for tenant %s — proceeding anyway for debug", tenant_id)
+            logger.warning("WhatsApp signature verification FAILED for tenant %s — rejected", tenant_id)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid signature")
+    else:
+        # No secret configured → cannot verify. Allow (so onboarding works)
+        # but warn loudly; admins should always set the app secret.
+        logger.warning(
+            "Tenant %s has no WhatsApp app_secret configured — webhook NOT verified. "
+            "Set it in channel config.",
+            tenant_id,
+        )
 
     payload = await request.json()
-
-    _last_wa_webhook = {
-        "received_at": _dt.datetime.utcnow().isoformat(),
-        "tenant_id": tenant_id,
-        "payload_keys": list(payload.keys()),
-        "has_messages": bool(payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages")),
-        "signature_check": sig_valid,
-        "app_secret_set": bool(app_secret),
-    }
-    try:
-        from app.db.redis import get_redis
-        await get_redis().set("debug:last_wa_webhook", _json.dumps(_last_wa_webhook), ex=3600)
-    except Exception:
-        pass
-
     background_tasks.add_task(_handle_whatsapp_message, payload, tenant.id)
     return {"ok": True}
 
@@ -246,15 +218,28 @@ async def telegram_webhook(
     tenant_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    secret_token: str | None = None,
 ) -> dict:
     tenant = await _get_tenant(db, tenant_id)
 
-    stored_token = tenant.channels.get("telegram", {}).get("webhook_secret_token")
-    if stored_token and secret_token != stored_token:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
+    # SECURITY: Telegram sends the webhook secret in this HTTP header
+    # (NOT as a query parameter). It must match the secret_token value
+    # registered via setWebhook.
+    stored_token = decrypt_secret(
+        tenant.channels.get("telegram", {}).get("webhook_secret_token")
+    )
+    if stored_token:
+        header_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_token != stored_token:
+            logger.warning("Telegram secret-token mismatch for tenant %s — rejected", tenant_id)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
+    else:
+        logger.warning(
+            "Tenant %s has no Telegram webhook_secret_token configured — webhook NOT verified. "
+            "Set it in channel config and pass the same value as secret_token to setWebhook.",
+            tenant_id,
+        )
 
-    bot_token = tenant.channels.get("telegram", {}).get("bot_token")
+    bot_token = decrypt_secret(tenant.channels.get("telegram", {}).get("bot_token"))
     if not bot_token:
         logger.warning("Tenant %s has no Telegram bot token", tenant_id)
         return {"ok": True}
@@ -292,6 +277,10 @@ async def telegram_webhook(
         if not query_text.strip():
             return {"ok": True}
 
+        # Quota gate BEFORE any LLM/embedding work.
+        if not await consume_message_quota(db, tenant.id):
+            return _tg_reply(chat_id, QUOTA_EXCEEDED_REPLY)
+
         bot_user = await bot_user_service.get_or_create_bot_user(
             db, tenant.id, Platform.telegram, chat_id
         )
@@ -315,13 +304,6 @@ async def telegram_webhook(
         )
 
         await rag.update_conversation(db, conversation.id)
-
-        if tenant.usage is None:
-            tenant.usage = {"message_count_month": 0, "active_users_month": 0}
-        new_usage = tenant.usage.copy()
-        new_usage["message_count_month"] = new_usage.get("message_count_month", 0) + 1
-        tenant.usage = new_usage
-        await db.commit()
 
         return _tg_reply(chat_id, answer)
 

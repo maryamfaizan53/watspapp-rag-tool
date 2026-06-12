@@ -1,9 +1,7 @@
 import logging
-import os
 import pickle
 from pathlib import Path
 from threading import Lock
-from typing import Optional
 
 import faiss
 import numpy as np
@@ -90,6 +88,28 @@ def add_vectors(
     return new_ids
 
 
+def rebuild_index(
+    tenant_id: str,
+    vectors: np.ndarray | None,
+    chunk_ids: list[str],
+) -> list[int]:
+    """
+    Atomically replace a tenant's index with a fresh one built from the given
+    vectors. This is the ONLY safe way to (a) rebuild on startup without
+    duplicating vectors already persisted on disk, and (b) remove vectors
+    after a document deletion (IndexFlatL2 has no per-vector remove).
+    Pass vectors=None / empty list to reset the tenant to an empty index.
+    """
+    index = _create_empty_index()
+    id_map: dict[int, str] = {}
+    if vectors is not None and len(vectors):
+        index.add(vectors)
+        id_map = {i: cid for i, cid in enumerate(chunk_ids)}
+    save_index(tenant_id, index, id_map)
+    logger.info("Rebuilt FAISS index for tenant %s (%d vectors)", tenant_id, index.ntotal)
+    return list(id_map.keys())
+
+
 def search(
     tenant_id: str, query_vector: np.ndarray, top_k: int = 5
 ) -> list[tuple[str, float]]:
@@ -104,6 +124,14 @@ def search(
         if idx >= 0 and idx in id_map:
             results.append((id_map[idx], float(dist)))
     return results
+
+
+def list_disk_tenants() -> list[str]:
+    """Tenant IDs that currently have an index directory on disk."""
+    root = Path(settings.faiss_index_dir)
+    if not root.exists():
+        return []
+    return [d.name for d in root.iterdir() if d.is_dir()]
 
 
 def delete_tenant_index(tenant_id: str) -> None:

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.api.auth import get_current_admin
 from app.db import get_db, faiss_store
 from app.db.models import Tenant, AdminUser
+from app.services.crypto import encrypt_secret
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/tenants", tags=["Tenants"])
@@ -39,6 +40,9 @@ class TenantCreateRequest(BaseModel):
 
 class ChannelConfigRequest(BaseModel):
     telegram_bot_token: Optional[str] = None
+    # Secret Telegram echoes back in the X-Telegram-Bot-Api-Secret-Token header.
+    # Pass the same value as secret_token when calling setWebhook.
+    telegram_webhook_secret_token: Optional[str] = None
     whatsapp_access_token: Optional[str] = None
     whatsapp_phone_number_id: Optional[str] = None
     whatsapp_app_secret: Optional[str] = None
@@ -62,11 +66,12 @@ def _serialize(tenant: Tenant) -> dict:
         "updated_at": tenant.updated_at.isoformat() if tenant.updated_at else None,
     }
 
-    # Hide raw channel secrets
+    # Hide raw channel secrets — never return them, even encrypted
     channels = data.get("channels", {})
     if "telegram" in channels:
         channels["telegram"]["configured"] = bool(channels["telegram"].get("bot_token"))
         channels["telegram"].pop("bot_token", None)
+        channels["telegram"].pop("webhook_secret_token", None)
         channels["telegram"].pop("webhook_url", None)
     if "whatsapp" in channels:
         channels["whatsapp"]["configured"] = bool(channels["whatsapp"].get("access_token"))
@@ -91,12 +96,13 @@ async def list_tenants(
 
     # Build query
     query = select(Tenant)
+    count_query = select(func.count()).select_from(Tenant)
     if status:
         query = query.where(Tenant.status == status)
+        count_query = count_query.where(Tenant.status == status)
 
-    # Get total count
-    count_result = await db.execute(select(func.count()).select_from(Tenant).where(Tenant.status == status if status else True))
-    total = count_result.scalar()
+    count_result = await db.execute(count_query)
+    total = count_result.scalar() or 0
 
     # Get paginated items
     query = query.offset(skip).limit(limit).order_by(Tenant.created_at.desc())
@@ -244,21 +250,28 @@ async def configure_channels(
     import copy
     channels = copy.deepcopy(tenant.channels) if tenant.channels else {}
 
+    # Secrets are encrypted at rest with Fernet (see app/services/crypto.py).
+    # Non-secret identifiers (phone_number_id, verify_token) stay plaintext.
     if body.telegram_bot_token is not None:
         channels.setdefault("telegram", {})
-        channels["telegram"]["bot_token"] = body.telegram_bot_token
+        channels["telegram"]["bot_token"] = encrypt_secret(body.telegram_bot_token)
         channels["telegram"]["configured"] = True
+    if body.telegram_webhook_secret_token is not None:
+        channels.setdefault("telegram", {})
+        channels["telegram"]["webhook_secret_token"] = encrypt_secret(
+            body.telegram_webhook_secret_token
+        )
 
     if body.whatsapp_access_token is not None:
         channels.setdefault("whatsapp", {})
-        channels["whatsapp"]["access_token"] = body.whatsapp_access_token
+        channels["whatsapp"]["access_token"] = encrypt_secret(body.whatsapp_access_token)
         channels["whatsapp"]["configured"] = True
     if body.whatsapp_phone_number_id is not None:
         channels.setdefault("whatsapp", {})
         channels["whatsapp"]["phone_number_id"] = body.whatsapp_phone_number_id
     if body.whatsapp_app_secret is not None:
         channels.setdefault("whatsapp", {})
-        channels["whatsapp"]["app_secret"] = body.whatsapp_app_secret
+        channels["whatsapp"]["app_secret"] = encrypt_secret(body.whatsapp_app_secret)
     if body.whatsapp_verify_token is not None:
         channels.setdefault("whatsapp", {})
         channels["whatsapp"]["verify_token"] = body.whatsapp_verify_token

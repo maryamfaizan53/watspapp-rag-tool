@@ -30,7 +30,8 @@ async def _generate_gemini(prompt: str) -> str:
         raise ValueError("GEMINI_API_KEY is not set")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+    # TLS verification MUST stay enabled — the URL carries the API key.
+    async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(url, json=payload)
         response.raise_for_status()
         data = response.json()
@@ -70,7 +71,8 @@ async def _generate_gemini_with_tools(prompt: str, tools: list) -> str:
     contents = [{"role": "user", "parts": [{"text": prompt}]}]
     payload = {"contents": contents, "tools": tools}
 
-    async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
+    # TLS verification MUST stay enabled — the URL carries the API key.
+    async with httpx.AsyncClient(timeout=60.0) as client:
         for _ in range(5):
             resp = await client.post(url, json=payload)
             resp.raise_for_status()

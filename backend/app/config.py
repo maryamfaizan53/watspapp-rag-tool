@@ -34,7 +34,14 @@ class Settings(BaseSettings):
     # FAISS
     faiss_index_dir: str = "./indexes"
 
-    # Encryption key for channel secrets (Fernet)
+    # RAG: maximum L2 distance for a chunk to count as "relevant".
+    # paraphrase-multilingual-MiniLM-L12-v2 vectors are normalised, so L2
+    # distance ranges 0..2 (0 = identical, 2 = opposite). 1.2 ≈ cosine sim 0.28.
+    # Lower = stricter grounding. Tune per knowledge base.
+    rag_max_distance: float = 1.2
+
+    # Encryption key for channel secrets (Fernet).
+    # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     encryption_key: str = ""
 
     # Seed admin

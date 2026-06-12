@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.api import auth, documents, health, metrics, tenants, webhooks
 from app.config import settings
@@ -16,7 +16,8 @@ from app.db import faiss_store
 from app.db.models import DocumentChunk, Document
 from app.db.postgres import close_db, connect_db, AsyncSessionLocal
 from app.db.redis import close_redis, connect_redis
-from app.services import embeddings
+from app.services import crypto
+from app.services.ingestion import rebuild_tenant_index
 from app.services.rate_limiter import limiter
 from app.services.usage_worker import start_worker, stop_worker
 
@@ -27,35 +28,81 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _enforce_production_config() -> None:
+    """Refuse to boot with insecure defaults in production."""
+    is_prod = settings.environment.lower() == "production"
+    if settings.jwt_secret in ("", "change-me"):
+        msg = "JWT_SECRET is the insecure default — set a strong random value."
+        if is_prod:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+    if not crypto.encryption_enabled():
+        msg = "ENCRYPTION_KEY is not set — channel secrets are stored in plaintext."
+        if is_prod:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+
+
+async def _reset_stuck_documents() -> None:
+    """
+    Documents stuck in pending/processing were interrupted by a crash or
+    restart (BackgroundTasks don't survive the process). Mark them failed so
+    the admin sees a clear state and can re-upload, instead of an eternal
+    'processing' spinner.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                update(Document)
+                .where(Document.status.in_(["pending", "processing"]))
+                .values(
+                    status="failed",
+                    error_message="Processing was interrupted by a server restart — please re-upload.",
+                )
+            )
+            await db.commit()
+            if result.rowcount:
+                logger.warning("Reset %d stuck documents to 'failed'", result.rowcount)
+    except Exception:
+        logger.exception("Failed to reset stuck documents (non-fatal)")
+
+
 async def _rebuild_faiss_indexes() -> None:
-    """Re-embed all ready chunks from DB into FAISS on startup (index is ephemeral in memory)."""
+    """
+    Rebuild every tenant's FAISS index FROM SCRATCH out of the database.
+
+    Why from scratch: the previous implementation called add_vectors(), which
+    appends to whatever index already exists on disk. On any host with a
+    persistent volume (HF Spaces /data, a VPS bind mount) that DUPLICATED the
+    entire index on every restart, and vectors of deleted documents lived
+    forever. rebuild_index() replaces the file atomically, so disk state
+    always mirrors the database.
+    """
     logger.info("Rebuilding FAISS indexes from database...")
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(DocumentChunk).join(Document).where(Document.status == "ready")
+                select(DocumentChunk.tenant_id)
+                .join(Document, Document.id == DocumentChunk.document_id)
+                .where(Document.status == "ready")
+                .distinct()
             )
-            chunks = result.scalars().all()
+            tenant_ids = {str(t) for t in result.scalars().all()}
 
-        if not chunks:
-            logger.info("No chunks found — FAISS index stays empty.")
-            return
+        for tenant_id in tenant_ids:
+            try:
+                await rebuild_tenant_index(tenant_id)
+            except Exception:
+                logger.exception("Index rebuild failed for tenant %s (non-fatal)", tenant_id)
 
-        # Group by tenant
-        from collections import defaultdict
-        import numpy as np
-        by_tenant: dict = defaultdict(list)
-        for chunk in chunks:
-            by_tenant[str(chunk.tenant_id)].append(chunk)
+        # Remove disk indexes for tenants that no longer have any ready chunks
+        # (deleted tenants / fully-emptied knowledge bases) so stale vectors
+        # can never be searched.
+        for disk_tenant in faiss_store.list_disk_tenants():
+            if disk_tenant not in tenant_ids:
+                faiss_store.delete_tenant_index(disk_tenant)
 
-        for tenant_id, tenant_chunks in by_tenant.items():
-            texts = [c.text for c in tenant_chunks]
-            placeholders = [f"{c.document_id}_{c.chunk_index}" for c in tenant_chunks]
-            vectors = np.array([embeddings.embed_text(t) for t in texts], dtype="float32")
-            faiss_store.add_vectors(tenant_id, vectors, placeholders)
-            logger.info("Rebuilt FAISS index for tenant %s: %d chunks", tenant_id, len(texts))
-
-        logger.info("FAISS rebuild complete.")
+        logger.info("FAISS rebuild complete (%d tenants)", len(tenant_ids))
     except Exception as exc:
         logger.exception("FAISS rebuild failed (non-fatal): %s", exc)
 
@@ -63,11 +110,13 @@ async def _rebuild_faiss_indexes() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    _enforce_production_config()
     logger.info("Connecting to PostgreSQL...")
     await connect_db()
     logger.info("Connecting to Redis...")
     await connect_redis()
     start_worker()
+    await _reset_stuck_documents()
     await _rebuild_faiss_indexes()
     # Ensure circuit breaker starts closed on every deploy
     from app.services.llm import _breaker
@@ -95,10 +144,17 @@ def create_app() -> FastAPI:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # CORS
+    # CORS — localhost dev origins only outside production
+    allow_origins = [settings.frontend_url]
+    if settings.environment.lower() != "production":
+        allow_origins += [
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://localhost:5175",
+        ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[settings.frontend_url, "http://localhost:5173", "http://localhost:5174", "http://localhost:5175"],
+        allow_origins=list(dict.fromkeys(allow_origins)),  # dedupe, keep order
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],

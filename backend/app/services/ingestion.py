@@ -1,6 +1,7 @@
 import hashlib
 import io
 import logging
+import os
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -65,6 +66,36 @@ def chunk_document(file_bytes: bytes, mime_type: str) -> list[dict]:
     return raw_chunks
 
 
+async def rebuild_tenant_index(tenant_id: str) -> None:
+    """
+    Rebuild a tenant's FAISS index from scratch using all chunks of READY
+    documents in the database. Used after a document deletion (IndexFlatL2
+    cannot remove individual vectors) and at application startup (so a
+    persisted disk index never accumulates duplicates or stale vectors).
+    """
+    from sqlalchemy import select
+
+    tid = UUID(tenant_id)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(DocumentChunk)
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .where(DocumentChunk.tenant_id == tid, Document.status == "ready")
+            .order_by(DocumentChunk.document_id, DocumentChunk.chunk_index)
+        )
+        chunks = result.scalars().all()
+
+    if not chunks:
+        faiss_store.rebuild_index(tenant_id, None, [])
+        return
+
+    texts = [c.text for c in chunks]
+    placeholders = [f"{c.document_id}_{c.chunk_index}" for c in chunks]
+    vectors = embed_batch(texts)
+    faiss_store.rebuild_index(tenant_id, vectors, placeholders)
+    logger.info("Rebuilt index for tenant %s: %d chunks", tenant_id, len(chunks))
+
+
 async def process_document(tenant_id: str, document_id: str, file_path: str) -> None:
     """
     Full ingestion pipeline: pending → processing → ready (or failed).
@@ -100,7 +131,6 @@ async def process_document(tenant_id: str, document_id: str, file_path: str) -> 
             vectors = embed_batch(texts)
 
             # Add to FAISS and collect assigned faiss_vector_ids
-            # Placeholder IDs for FAISS internal mapping
             placeholder_ids = [f"{document_id}_{i}" for i in range(len(chunks))]
             faiss_ids = faiss_store.add_vectors(tenant_id, vectors, placeholder_ids)
 
@@ -115,14 +145,8 @@ async def process_document(tenant_id: str, document_id: str, file_path: str) -> 
                     page_number=chunk_meta.get("page_number"),
                 )
                 db.add(chunk)
-            
-            await db.commit()
 
-            # Optional: update FAISS id_map with real DB IDs? 
-            # In PostgreSQL we use UUIDs, let's keep it consistent.
-            # Re-fetch chunks to get their real IDs (though FAISS store used placeholders)
-            # For simplicity, we'll keep the placeholders in FAISS if we search by them, 
-            # but usually we search and get faiss_vector_id, then fetch from DB.
+            await db.commit()
 
             # Mark document ready
             doc.status = "ready"
@@ -138,13 +162,12 @@ async def process_document(tenant_id: str, document_id: str, file_path: str) -> 
             logger.exception("Ingestion failed for document %s: %s", document_id, exc)
             # Rollback and mark failed
             await db.rollback()
-            doc = await db.get(Document, did) # re-fetch after rollback
+            doc = await db.get(Document, did)  # re-fetch after rollback
             if doc:
                 doc.status = "failed"
                 doc.error_message = str(exc)
                 await db.commit()
         finally:
             # Cleanup temp file
-            import os
             if os.path.exists(file_path):
                 os.remove(file_path)

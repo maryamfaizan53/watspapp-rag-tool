@@ -1,161 +1,195 @@
 """
-Integration test: document upload → ingestion pipeline → RAG query returns content.
+Integration tests: document upload endpoints + RAG query path.
+
+These tests run against the real FastAPI app with the DB session and admin
+auth overridden, so no database / Redis / network is required.
+
+Notes vs. the old version of this file:
+- FALLBACK_NO_DATA no longer exists (rag.py was rewritten); removed.
+- rag.answer_query now pre-fetches live PSX data for detected symbols and
+  uses safe_generate_with_tools on the no-live-data path, so we patch
+  app.services.rag._prefetch_stock_data and llm.safe_generate_with_tools —
+  otherwise a query like "What is OGDC EPS?" would hit real network calls.
 """
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import numpy as np
 import pytest
-from httpx import ASGITransport, AsyncClient
+from fastapi.testclient import TestClient
 
+from app.main import app
+from app.db import get_db
 from app.api.auth import get_current_admin
-from app.db.models import AdminUser
 
-TENANT_ID = uuid.uuid4()
-
-FIXTURE_TEXT = (
-    "OGDC Annual Report 2024. "
-    "The company reported earnings per share (EPS) of PKR 45.23 for FY2024. "
-    "Return on equity stood at 18.7 percent. "
-    "P/E ratio as of December 2024 was 7.3."
-)
+TENANT_ID = str(uuid.uuid4())
 
 
-def _fake_admin() -> AdminUser:
-    return AdminUser(
-        id=uuid.uuid4(),
-        email="admin@test.com",
-        hashed_password="x",
-        role="super_admin",
-        is_active=True,
+# ── Fixtures ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def mock_db():
+    """Async DB session mock whose execute() result is configurable per-test."""
+    db = AsyncMock()
+    db.add = MagicMock()
+    return db
+
+
+@pytest.fixture()
+def client(mock_db):
+    """TestClient with DB + admin auth overridden and rate limiting disabled."""
+    async def _override_db():
+        yield mock_db
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_current_admin] = lambda: MagicMock(email="admin@test.local")
+
+    # slowapi limiter would otherwise try to reach Redis storage on each request
+    if hasattr(app.state, "limiter"):
+        app.state.limiter.enabled = False
+
+    with patch("app.api.documents.process_document", new_callable=AsyncMock):
+        yield TestClient(app, raise_server_exceptions=True)
+
+    app.dependency_overrides.clear()
+
+
+def _no_duplicate(db):
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=result)
+
+
+def _has_duplicate(db):
+    existing = MagicMock()
+    existing.id = uuid.uuid4()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = existing
+    db.execute = AsyncMock(return_value=result)
+
+
+# ── Upload endpoint ───────────────────────────────────────────────────
+
+
+def test_upload_txt_returns_202(client, mock_db):
+    _no_duplicate(mock_db)
+    resp = client.post(
+        f"/admin/tenants/{TENANT_ID}/documents",
+        files={"file": ("psx-faq.txt", b"OGDC is an oil and gas company.", "text/plain")},
     )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["name"] == "psx-faq.txt"
 
 
-def _common_patches(mock_db):
-    """Patches needed for every document endpoint test."""
-    return [
-        # Patch get_db WHERE IT IS USED (imported name in each consumer module)
-        patch("app.api.documents.get_db", return_value=mock_db),
-        # Patch lifespan hooks via their LOCAL names in main.py
-        patch("app.main.connect_db", new_callable=AsyncMock),
-        patch("app.main.close_db", new_callable=AsyncMock),
-        patch("app.main.connect_redis", new_callable=AsyncMock),
-        patch("app.main.close_redis", new_callable=AsyncMock),
-        patch("app.main.start_worker"),
-        patch("app.main.stop_worker"),
-        # Redis dependency (used by slowapi middleware)
-        patch("app.db.redis.get_redis", return_value=AsyncMock()),
-    ]
+def test_upload_duplicate_returns_409(client, mock_db):
+    _has_duplicate(mock_db)
+    resp = client.post(
+        f"/admin/tenants/{TENANT_ID}/documents",
+        files={"file": ("psx-faq.txt", b"OGDC is an oil and gas company.", "text/plain")},
+    )
+    assert resp.status_code == 409
+    assert "already" in resp.json()["detail"].lower()
 
 
-@pytest.mark.asyncio
-async def test_upload_document_accepted():
-    """POST /admin/tenants/{id}/documents with a valid TXT file returns HTTP 202."""
-    mock_db = AsyncMock()
-    mock_db.execute.return_value.scalar_one_or_none.return_value = None
+def test_upload_unsupported_mime_returns_415(client, mock_db):
+    _no_duplicate(mock_db)
+    resp = client.post(
+        f"/admin/tenants/{TENANT_ID}/documents",
+        files={"file": ("virus.exe", b"\x00\x01", "application/x-msdownload")},
+    )
+    assert resp.status_code == 415
 
-    patches = _common_patches(mock_db) + [
-        patch("app.api.documents.process_document", new_callable=AsyncMock),
-    ]
 
-    entered = [p.__enter__() for p in patches]
-    try:
-        from app.main import create_app
+def test_upload_invalid_tenant_id_returns_400(client, mock_db):
+    _no_duplicate(mock_db)
+    resp = client.post(
+        "/admin/tenants/not-a-uuid/documents",
+        files={"file": ("a.txt", b"hello", "text/plain")},
+    )
+    assert resp.status_code == 400
 
-        test_app = create_app()
-        test_app.dependency_overrides[get_current_admin] = _fake_admin
 
-        async with AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://test"
-        ) as ac:
-            response = await ac.post(
-                f"/admin/tenants/{TENANT_ID}/documents",
-                files={"file": ("report.txt", FIXTURE_TEXT.encode(), "text/plain")},
-            )
-    finally:
-        for p in reversed(patches):
-            p.__exit__(None, None, None)
-
-    assert response.status_code == 202
+# ── RAG query path (service-level integration) ────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_duplicate_document_returns_409():
-    """Uploading the same content hash twice returns HTTP 409."""
-    import hashlib
+async def test_rag_query_with_context_uses_kb_and_live_data():
+    """KB chunk within distance threshold + prefetched live data → live-data prompt path."""
+    from app.services import rag
 
-    existing_hash = hashlib.sha256(FIXTURE_TEXT.encode()).hexdigest()
-
-    mock_db = AsyncMock()
-    
-    existing_doc = MagicMock()
-    existing_doc.content_hash = existing_hash
-    mock_db.execute.return_value.scalar_one_or_none.return_value = existing_doc
-
-    patches = _common_patches(mock_db)
-    entered = [p.__enter__() for p in patches]
-    try:
-        from app.main import create_app
-
-        test_app = create_app()
-        test_app.dependency_overrides[get_current_admin] = _fake_admin
-
-        async with AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://test"
-        ) as ac:
-            response = await ac.post(
-                f"/admin/tenants/{TENANT_ID}/documents",
-                files={"file": ("report.txt", FIXTURE_TEXT.encode(), "text/plain")},
-            )
-    finally:
-        for p in reversed(patches):
-            p.__exit__(None, None, None)
-
-    assert response.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_ingestion_pipeline_content_queryable_via_rag():
-    """
-    After ingestion, content from the fixture document is present in chunks
-    and the RAG service returns a non-empty answer referencing that content.
-    """
-    from app.services.ingestion import chunk_document
-
-    file_bytes = FIXTURE_TEXT.encode()
-    chunks = chunk_document(file_bytes, "text/plain")
-
-    all_text = " ".join(c["text"] for c in chunks)
-    assert "EPS" in all_text or "earnings" in all_text.lower()
-    assert "7.3" in all_text
-    assert len(chunks) >= 1
-
-    mock_db = AsyncMock()
-    
+    tenant_id = uuid.uuid4()
+    conv_id = uuid.uuid4()
     chunk = MagicMock()
     chunk.id = uuid.uuid4()
-    chunk.text = chunks[0]["text"]
-    
+    chunk.text = "OGDC reported EPS of 25.4 PKR for FY2025."
+
+    db = AsyncMock()
+
     async def mock_execute(query):
         result = MagicMock()
-        if "document_chunks" in str(query):
+        q = str(query)
+        if "document_chunks" in q:
             result.scalar_one_or_none.return_value = chunk
-        elif "messages" in str(query):
+        else:
             result.scalars.return_value.all.return_value = []
         return result
-    
-    mock_db.execute.side_effect = mock_execute
 
-    query_vector = np.zeros(384, dtype="float32")
+    db.execute.side_effect = mock_execute
 
     with (
-        patch("app.services.rag.embeddings.embed_text", return_value=query_vector),
-        patch("app.services.rag.faiss_store.search", return_value=[(f"{uuid.uuid4()}_0", 0.05)]),
-        patch("app.services.rag.llm.safe_generate", new_callable=AsyncMock, return_value="OGDC EPS is PKR 45.23 for FY2024."),
+        patch("app.services.rag.embeddings.embed_text", return_value=MagicMock()),
+        patch("app.services.rag.faiss_store.search", return_value=[(str(chunk.id), 0.4)]),
+        patch(
+            "app.services.rag._prefetch_stock_data",
+            new_callable=AsyncMock,
+            return_value='{"symbol": "OGDC", "price": 132.5, "status": "ok"}',
+        ),
+        patch(
+            "app.services.rag.llm.safe_generate",
+            new_callable=AsyncMock,
+            return_value="OGDC's EPS for FY2025 was 25.4 PKR.",
+        ) as mock_gen,
     ):
-        from app.services.rag import FALLBACK_NO_DATA, answer_query
+        answer, chunk_ids = await rag.answer_query(db, tenant_id, conv_id, "What is OGDC EPS?")
 
-        answer, _ = await answer_query(mock_db, uuid.uuid4(), uuid.uuid4(), "What is OGDC EPS?")
+    assert "25.4" in answer
+    assert chunk_ids == [str(chunk.id)]
+    prompt = mock_gen.call_args[0][0]
+    assert "OGDC reported EPS" in prompt  # KB context injected
+    assert '"status": "ok"' in prompt     # live data injected
 
-    assert answer != FALLBACK_NO_DATA
-    assert "45.23" in answer or "EPS" in answer
+
+@pytest.mark.asyncio
+async def test_rag_query_llm_down_returns_fallback():
+    """Both LLM providers down → graceful FALLBACK_LLM_DOWN, never an exception."""
+    from app.services import rag
+    from app.services.rag import FALLBACK_LLM_DOWN
+
+    db = AsyncMock()
+
+    async def mock_execute(query):
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = None
+        result.scalars.return_value.all.return_value = []
+        return result
+
+    db.execute.side_effect = mock_execute
+
+    with (
+        patch("app.services.rag.embeddings.embed_text", return_value=MagicMock()),
+        patch("app.services.rag.faiss_store.search", return_value=[]),
+        patch("app.services.rag._prefetch_stock_data", new_callable=AsyncMock, return_value=""),
+        # safe_generate_with_tools swallows provider errors internally and
+        # returns None when both providers / breakers are down — emulate that.
+        patch(
+            "app.services.rag.llm.safe_generate_with_tools",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        answer, chunk_ids = await rag.answer_query(db, uuid.uuid4(), uuid.uuid4(), "hello")
+
+    assert answer == FALLBACK_LLM_DOWN
+    assert chunk_ids == []

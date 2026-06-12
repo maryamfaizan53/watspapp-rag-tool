@@ -1,6 +1,5 @@
 import hashlib
 import logging
-from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
@@ -10,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import get_current_admin
 from app.db import get_db, faiss_store
 from app.db.models import Document, DocumentChunk, AdminUser
-from app.services.ingestion import process_document
+from app.services.ingestion import process_document, rebuild_tenant_index
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/tenants/{tenant_id}/documents", tags=["Documents"])
@@ -166,6 +165,7 @@ async def get_document(
 async def delete_document(
     tenant_id: str,
     document_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ) -> None:
@@ -192,7 +192,11 @@ async def delete_document(
     await db.execute(sql_delete(Document).where(Document.id == did))
     await db.commit()
 
-    # Rebuild FAISS index cache
+    # IndexFlatL2 has no per-vector delete, so the index must be rebuilt from
+    # the remaining chunks — otherwise the deleted document's vectors stay on
+    # disk and keep matching queries (stale data). Evicting the cache alone is
+    # NOT enough because the next load reads the old disk file.
     faiss_store.evict_from_cache(tenant_id)
+    background_tasks.add_task(rebuild_tenant_index, tenant_id)
 
-    logger.info("Deleted document %s from tenant %s", document_id, tenant_id)
+    logger.info("Deleted document %s from tenant %s — index rebuild scheduled", document_id, tenant_id)

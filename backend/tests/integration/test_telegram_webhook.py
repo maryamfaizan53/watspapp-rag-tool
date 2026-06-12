@@ -1,178 +1,185 @@
 """
-Integration test: POST /webhooks/telegram/{tenant_id} → RAG pipeline → Telegram reply.
+Integration tests: Telegram webhook (app/api/webhooks.py).
+
+Runs against the real FastAPI app with the DB session overridden. Patches:
+- app.api.webhooks.consume_message_quota  (mock DB can't do SELECT FOR UPDATE)
+- app.services.rag._prefetch_stock_data   (text like "OGDC" would otherwise
+  trigger real PSX network calls)
+- LLM safe_generate / safe_generate_with_tools
+
+Also covers the new security behaviour:
+- the webhook secret is read from the X-Telegram-Bot-Api-Secret-Token HEADER
+  (Telegram never sends it as a query param) and mismatches are rejected 403
+- over-quota tenants get QUOTA_EXCEEDED_REPLY without touching the RAG pipeline
 """
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from fastapi.testclient import TestClient
 
-TENANT_ID = uuid.uuid4()
-BOT_USER_ID = uuid.uuid4()
-CONV_ID = uuid.uuid4()
-DOC_ID = uuid.uuid4()
-CHUNK_ID = uuid.uuid4()
+from app.main import app
+from app.db import get_db
+from app.services.usage_service import QUOTA_EXCEEDED_REPLY
+
+TENANT_ID = str(uuid.uuid4())
+CHAT_ID = 5551234
 
 
-def _make_mock_db():
-    db = AsyncMock()
-    
-    # Mock Tenant
+def _make_tenant(secret_token: str | None = None):
     tenant = MagicMock()
-    tenant.id = TENANT_ID
+    tenant.id = uuid.UUID(TENANT_ID)
     tenant.status = "active"
-    tenant.channels = {"telegram": {"bot_token": "test-bot-token", "configured": True}}
-    tenant.usage = {"message_count_month": 0}
-    
-    # Mock BotUser
-    bot_user = MagicMock()
-    bot_user.id = BOT_USER_ID
-    bot_user.tenant_id = TENANT_ID
-    bot_user.platform = "telegram"
-    bot_user.platform_id = "12345"
-    
-    # Mock Conversation
-    conv = MagicMock()
-    conv.id = CONV_ID
-    conv.last_message_at = None # will be set in rag.py
-    conv.message_count = 0
-    
-    # Mock DocumentChunk
-    chunk = MagicMock()
-    chunk.id = CHUNK_ID
-    chunk.text = "OGDC P/E is 7.3"
-    
-    # Setup db.execute responses
-    async def mock_execute(query):
-        # This is a very simplified mock of SQLAlchemy execute
-        # In a real test we'd use a real test database (SQLite/Postgres)
-        result = MagicMock()
-        if "tenants" in str(query):
-            result.scalar_one_or_none.return_value = tenant
-        elif "bot_users" in str(query):
-            result.scalar_one_or_none.return_value = bot_user
-        elif "conversations" in str(query):
-            result.scalar_one_or_none.return_value = None # for first call in rag.get_or_create
-        elif "document_chunks" in str(query):
-            result.scalar_one_or_none.return_value = chunk
-        elif "messages" in str(query):
-            result.scalars.return_value.all.return_value = []
-        return result
+    channels = {"telegram": {"bot_token": "123456:plain-legacy-token"}}
+    if secret_token:
+        channels["telegram"]["webhook_secret_token"] = secret_token
+    tenant.channels = channels
+    tenant.usage = {}
+    tenant.quota = {"messages_per_month": 1000}
+    return tenant
 
-    db.execute = AsyncMock(side_effect=mock_execute)
-    db.get = AsyncMock(side_effect=lambda model, id: tenant if "Tenant" in str(model) else None)
-    
+
+@pytest.fixture()
+def mock_db():
+    db = AsyncMock()
+    db.add = MagicMock()
     return db
 
 
-TELEGRAM_UPDATE = {
-    "update_id": 1,
-    "message": {
-        "message_id": 1,
-        "chat": {"id": "12345", "type": "private"},
-        "text": "What is OGDC P/E ratio?",
-        "from": {"id": 12345, "is_bot": False, "first_name": "Investor"},
-    },
-}
+def _wire_tenant(db, tenant):
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = tenant
+    result.scalars.return_value.all.return_value = []
+    db.execute = AsyncMock(return_value=result)
 
 
-def _make_patches(mock_db):
-    import numpy as np
-    
-    # Mock AsyncSessionLocal to return our mock_db
-    mock_session_factory = MagicMock()
-    mock_session_factory.return_value.__aenter__.return_value = mock_db
+@pytest.fixture()
+def client(mock_db):
+    async def _override_db():
+        yield mock_db
 
-    return [
-        patch("app.db.get_db", return_value=mock_db),
-        patch("app.db.AsyncSessionLocal", new=mock_session_factory),
-        patch("app.db.redis.get_redis", return_value=AsyncMock()),
-        patch("app.services.embeddings.embed_text", return_value=np.zeros(384, dtype="float32")),
-        patch("app.db.faiss_store.search", return_value=[(f"{DOC_ID}_0", 0.05)]),
+    app.dependency_overrides[get_db] = _override_db
+    if hasattr(app.state, "limiter"):
+        app.state.limiter.enabled = False
+    yield TestClient(app, raise_server_exceptions=True)
+    app.dependency_overrides.clear()
+
+
+def _tg_text_update(text: str) -> dict:
+    return {
+        "update_id": 10001,
+        "message": {
+            "message_id": 1,
+            "from": {"id": CHAT_ID, "is_bot": False, "first_name": "Ali"},
+            "chat": {"id": CHAT_ID, "type": "private"},
+            "date": 1760000000,
+            "text": text,
+        },
+    }
+
+
+def _common_patches(answer="OGDC is trading at 132.50 PKR."):
+    bot_user = MagicMock()
+    bot_user.id = uuid.uuid4()
+    conversation = MagicMock()
+    conversation.id = uuid.uuid4()
+    return (
+        patch("app.api.webhooks.consume_message_quota", new_callable=AsyncMock, return_value=True),
         patch(
-            "app.services.llm.safe_generate",
-            new_callable=AsyncMock,
-            return_value="OGDC P/E ratio is approximately 7.3.",
+            "app.api.webhooks.bot_user_service.get_or_create_bot_user",
+            new_callable=AsyncMock, return_value=bot_user,
         ),
-        patch("app.providers.telegram.send_text_reply", new_callable=AsyncMock),
-        patch("app.main.connect_db", new_callable=AsyncMock),
-        patch("app.main.connect_redis", new_callable=AsyncMock),
-        patch("app.main.close_db", new_callable=AsyncMock),
-        patch("app.main.close_redis", new_callable=AsyncMock),
-        patch("app.main.start_worker"),
-        patch("app.main.stop_worker"),
-    ]
+        patch(
+            "app.api.webhooks.rag.get_or_create_conversation",
+            new_callable=AsyncMock, return_value=conversation,
+        ),
+        patch(
+            "app.api.webhooks.rag.answer_query",
+            new_callable=AsyncMock, return_value=(answer, []),
+        ),
+        patch("app.api.webhooks.rag.update_conversation", new_callable=AsyncMock),
+    )
 
 
-@pytest.mark.asyncio
-async def test_telegram_webhook_returns_ok_and_sends_reply():
-    """
-    POST /webhooks/telegram/{tenant_id} returns 200 {"ok": true}
-    and the background handler sends a Telegram reply.
-    """
-    mock_db = _make_mock_db()
-    patches = _make_patches(mock_db)
-
-    # Enter all patches
-    mocks = [p.__enter__() for p in patches]
-    try:
-        mock_send = mocks[6]  # app.providers.telegram.send_text_reply
-
-        from app.main import create_app
-
-        test_app = create_app()
-
-        async with AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://test"
-        ) as ac:
-            response = await ac.post(
-                f"/webhooks/telegram/{TENANT_ID}",
-                json=TELEGRAM_UPDATE,
-            )
-
-        assert response.status_code == 200
-        assert response.json() == {"ok": True}
-
-        # Background tasks run during request in test client
-        # We might need to wait or use a more sophisticated way to test background tasks
-        # In FastAPI test client with background tasks, they run after the response is returned
-        # but before the `async with` block exits.
-        
-        # Wait a bit for the background task to complete if needed
-        # (Though usually it's synchronous in test client if not using real async)
-        
-        # mock_send.assert_called_once() # This might be flaky in background tasks
-    finally:
-        for p in reversed(patches):
-            p.__exit__(None, None, None)
+# ── Happy path ────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_telegram_webhook_404_for_unknown_tenant():
-    """Webhook for an unknown tenant returns 404."""
-    mock_db = AsyncMock()
-    mock_db.execute.return_value.scalar_one_or_none.return_value = None
+def test_telegram_text_message_replies_via_webhook_response(client, mock_db):
+    _wire_tenant(mock_db, _make_tenant())
+    p1, p2, p3, p4, p5 = _common_patches()
+    with p1, p2, p3, p4 as mock_answer, p5:
+        resp = client.post(f"/webhooks/telegram/{TENANT_ID}", json=_tg_text_update("OGDC price?"))
 
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["method"] == "sendMessage"
+    assert body["chat_id"] == CHAT_ID
+    assert "132.50" in body["text"]
+    mock_answer.assert_awaited_once()
+
+
+# ── Secret token (header, not query param) ────────────────────────────
+
+
+def test_telegram_secret_token_checked_from_header(client, mock_db):
+    _wire_tenant(mock_db, _make_tenant(secret_token="s3cret"))
+    p1, p2, p3, p4, p5 = _common_patches()
+    with p1, p2, p3, p4, p5:
+        ok = client.post(
+            f"/webhooks/telegram/{TENANT_ID}",
+            json=_tg_text_update("hello"),
+            headers={"X-Telegram-Bot-Api-Secret-Token": "s3cret"},
+        )
+    assert ok.status_code == 200
+
+
+def test_telegram_secret_token_mismatch_rejected_403(client, mock_db):
+    _wire_tenant(mock_db, _make_tenant(secret_token="s3cret"))
+    resp = client.post(
+        f"/webhooks/telegram/{TENANT_ID}",
+        json=_tg_text_update("hello"),
+        headers={"X-Telegram-Bot-Api-Secret-Token": "WRONG"},
+    )
+    assert resp.status_code == 403
+
+
+def test_telegram_secret_token_missing_header_rejected_403(client, mock_db):
+    _wire_tenant(mock_db, _make_tenant(secret_token="s3cret"))
+    resp = client.post(f"/webhooks/telegram/{TENANT_ID}", json=_tg_text_update("hello"))
+    assert resp.status_code == 403
+
+
+# ── Quota enforcement ─────────────────────────────────────────────────
+
+
+def test_telegram_over_quota_replies_quota_message_without_rag(client, mock_db):
+    _wire_tenant(mock_db, _make_tenant())
     with (
-        patch("app.db.get_db", return_value=mock_db),
-        patch("app.main.connect_db", new_callable=AsyncMock),
-        patch("app.main.connect_redis", new_callable=AsyncMock),
-        patch("app.main.close_db", new_callable=AsyncMock),
-        patch("app.main.close_redis", new_callable=AsyncMock),
-        patch("app.db.redis.get_redis", return_value=AsyncMock()),
-        patch("app.main.start_worker"),
-        patch("app.main.stop_worker"),
+        patch("app.api.webhooks.consume_message_quota", new_callable=AsyncMock, return_value=False),
+        patch("app.api.webhooks.rag.answer_query", new_callable=AsyncMock) as mock_answer,
     ):
-        from app.main import create_app
+        resp = client.post(f"/webhooks/telegram/{TENANT_ID}", json=_tg_text_update("OGDC price?"))
 
-        test_app = create_app()
+    assert resp.status_code == 200
+    assert resp.json()["text"] == QUOTA_EXCEEDED_REPLY
+    mock_answer.assert_not_awaited()  # over-quota must never burn LLM tokens
 
-        async with AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://test"
-        ) as ac:
-            response = await ac.post(
-                f"/webhooks/telegram/{uuid.uuid4()}",
-                json=TELEGRAM_UPDATE,
-            )
 
-    assert response.status_code == 404
+# ── Edge cases ────────────────────────────────────────────────────────
+
+
+def test_telegram_inactive_tenant_returns_404(client, mock_db):
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    mock_db.execute = AsyncMock(return_value=result)
+    resp = client.post(f"/webhooks/telegram/{TENANT_ID}", json=_tg_text_update("hi"))
+    assert resp.status_code == 404
+
+
+def test_telegram_missing_bot_token_acks_silently(client, mock_db):
+    tenant = _make_tenant()
+    tenant.channels = {"telegram": {}}
+    _wire_tenant(mock_db, tenant)
+    resp = client.post(f"/webhooks/telegram/{TENANT_ID}", json=_tg_text_update("hi"))
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}

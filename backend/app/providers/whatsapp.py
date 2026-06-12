@@ -15,9 +15,10 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 @dataclass
 class WhatsAppMessage:
     from_number: str        # E.164 sender number e.g. "923001234567"
-    body: str               # text body
+    body: str               # text body ("" for unsupported types)
     message_id: str         # Meta message ID (for deduplication)
     display_name: str = ""  # sender's WhatsApp display name
+    unsupported: bool = False  # True for voice/image/sticker/etc.
 
 
 class InvalidSignatureError(Exception):
@@ -36,7 +37,9 @@ def verify_signature(app_secret: str, payload_bytes: bytes, signature_header: st
 def parse_webhook(payload: dict) -> Optional[WhatsAppMessage]:
     """
     Parse a Meta WhatsApp Cloud API webhook payload.
-    Returns None if the event is not an incoming text message.
+    Returns None for non-message events (status updates etc.).
+    Returns a WhatsAppMessage with unsupported=True for non-text message
+    types so the caller can reply politely instead of silently dropping.
     """
     try:
         entry = payload["entry"][0]
@@ -48,11 +51,17 @@ def parse_webhook(payload: dict) -> Optional[WhatsAppMessage]:
             return None
 
         msg = messages[0]
-        if msg.get("type") != "text":
-            return None
-
         contacts = value.get("contacts", [{}])
         display_name = contacts[0].get("profile", {}).get("name", "")
+
+        if msg.get("type") != "text":
+            return WhatsAppMessage(
+                from_number=msg.get("from", ""),
+                body="",
+                message_id=msg.get("id", ""),
+                display_name=display_name,
+                unsupported=True,
+            )
 
         return WhatsAppMessage(
             from_number=msg["from"],
@@ -80,7 +89,9 @@ async def send_text_reply(
         "text": {"body": text},
     }
     headers = {"Authorization": f"Bearer {access_token}"}
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+    # NOTE: TLS verification MUST stay enabled — this call carries the
+    # tenant's Meta access token. Never set verify=False here.
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code != 200:
             logger.error("WhatsApp send error %s: %s", resp.status_code, resp.text)

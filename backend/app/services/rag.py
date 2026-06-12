@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import select, update, desc
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db import faiss_store
 from app.db.models import Conversation, Message, DocumentChunk
 from app.services import embeddings, llm
@@ -19,10 +21,14 @@ FALLBACK_LLM_DOWN = (
     "The AI service is temporarily unavailable. Please try again shortly."
 )
 
+NO_CONTEXT_MARKER = (
+    "NO RELEVANT DOCUMENTS FOUND in the knowledge base for this question."
+)
+
 # Used when live stock data was pre-fetched in Python (LLM just formats the answer)
 _PROMPT_WITH_LIVE_DATA = """You are an expert PSX (Pakistan Stock Exchange) financial assistant.
 
-LIVE STOCK DATA (fetched right now — use this in your answer):
+LIVE STOCK DATA (fetched right now — this is the ONLY price data you may use):
 {live_data}
 
 Knowledge base (uploaded documents):
@@ -33,7 +39,12 @@ Conversation history:
 
 User question: {question}
 
-Answer using ONLY the LIVE STOCK DATA above. For each company: state its name, symbol, current price in PKR, change, and percent change. List all companies clearly. If web search results appear instead of a structured price, extract the price from the text. Do not guess or add companies not in the data.
+STRICT RULES — follow exactly:
+1. Use ONLY the LIVE STOCK DATA above for prices. For each company with a price: state name, symbol, current price in PKR, change, and percent change.
+2. If an entry has status "unavailable" (or no price), say clearly that its live price could not be fetched right now. NEVER invent, estimate, or recall a price from memory.
+3. Do not add companies that are not in the data.
+4. For non-price parts of the question, answer ONLY from the knowledge base context above. If the context says no relevant documents were found, say you don't have that information in the knowledge base.
+5. This is information only, not financial or investment advice.
 
 Answer:"""
 
@@ -44,16 +55,17 @@ TOOLS AVAILABLE:
 - get_stock_price_by_query(query) — live PSX stock price. Pass EXACTLY what the user typed.
 - get_kse100_index() — live KSE-100 index value.
 - get_company_info(query) — market cap, P/E, EPS, 52-week high/low, dividend yield.
-- web_search(query) — search web for PSX news, account procedures, dividends, regulations.
+- web_search(query) — search web for PSX news, account procedures, dividends, regulations. NEVER for prices.
 
-RULES:
+STRICT RULES — follow exactly:
 1. ALWAYS call a tool first. Never write "[price]" or guessed numbers.
-2. Stock price → get_stock_price_by_query(EXACT user text).
-3. KSE-100 → get_kse100_index().
-4. Company fundamentals → get_company_info(EXACT user text).
-5. Account opening, dividends, regulations, news → web_search().
-6. Use tool results directly and confidently. Do not hedge or apologise.
+2. Stock price → get_stock_price_by_query(EXACT user text). KSE-100 → get_kse100_index(). Fundamentals → get_company_info(EXACT user text).
+3. Account opening, dividends, regulations, news → web_search().
+4. If a tool returns status "unavailable" or an error, tell the user that data could not be fetched right now. NEVER invent, estimate, or recall numbers from memory, and never pull prices out of web search text.
+5. For questions about the uploaded documents, answer ONLY from the knowledge base context below. If the context says no relevant documents were found and no tool can answer, say you don't have that information.
+6. Use successful tool results directly and confidently. Do not hedge on data you actually fetched.
 7. Off-topic (non-finance) → politely decline.
+8. This is information only, not financial or investment advice.
 
 Knowledge base (uploaded documents):
 {context}
@@ -82,6 +94,8 @@ def _format_price_direct(live_data: str) -> str | None:
             pct = d.get("change_percent")
             source = d.get("source", "")
             if price is None:
+                if sym:
+                    lines.append(f"*{sym}*\nLive price unavailable right now — please try again shortly.")
                 continue
             arrow = "▲" if (change or 0) >= 0 else "▼"
             line = f"*{name} ({sym})*\nPrice: PKR {price}"
@@ -106,7 +120,6 @@ def _extract_all_symbols(query_text: str) -> list[str]:
     q = query_text.lower()
     found: dict[str, bool] = {}  # symbol → seen (ordered dict behaviour in py3.7+)
 
-    # Exact match pass
     for key, sym in _PSX_NAME_MAP.items():
         if re.search(r'\b' + re.escape(key) + r'\b', q):
             found[sym] = True
@@ -118,7 +131,9 @@ async def _prefetch_stock_data(query_text: str) -> str:
     """
     Find ALL PSX companies mentioned in the query and pre-fetch their prices in parallel.
     Returns a multi-company JSON string, or "" if no known stocks found.
-    Bypasses the LLM's tendency to 'correct' company names before tool calls.
+
+    Results with status="unavailable" are INCLUDED on purpose — the prompt
+    instructs the model to relay the unavailability instead of guessing.
     """
     symbols = _extract_all_symbols(query_text)
     if not symbols:
@@ -132,7 +147,11 @@ async def _prefetch_stock_data(query_text: str) -> str:
     for sym, result in zip(symbols, results):
         if isinstance(result, Exception):
             logger.warning("Pre-fetch error for %s: %s", sym, result)
-        elif isinstance(result, dict) and "error" not in result:
+            data_parts.append(json.dumps({
+                "symbol": sym, "status": "unavailable",
+                "error": "Live price could not be fetched right now.",
+            }, indent=2))
+        elif isinstance(result, dict):
             data_parts.append(json.dumps(result, indent=2))
 
     return "\n---\n".join(data_parts) if data_parts else ""
@@ -212,7 +231,7 @@ async def answer_query(
     conversation_id: str | UUID,
     query_text: str,
 ) -> tuple[str, list[str]]:
-    """Full RAG pipeline: embed → search → (pre-fetch or tools) → generate."""
+    """Full RAG pipeline: embed → search → relevance filter → (pre-fetch or tools) → generate."""
     tid = str(tenant_id)
     cid = UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
 
@@ -222,13 +241,24 @@ async def answer_query(
     # 2. FAISS similarity search
     results = faiss_store.search(tid, query_vector, top_k=5)
 
+    # 2b. RELEVANCE FILTER — without this, the 5 nearest chunks are injected
+    # as "context" no matter how far away they are, and the model treats
+    # irrelevant text as ground truth. Chunks beyond the distance threshold
+    # are discarded; if nothing survives, the prompt explicitly says so.
+    relevant = [(pid, dist) for pid, dist in results if dist <= settings.rag_max_distance]
+    if results and not relevant:
+        logger.info(
+            "FAISS hits for tenant %s all above distance threshold %.2f (best=%.3f) — treating as no context",
+            tid, settings.rag_max_distance, results[0][1],
+        )
+
     # 3. Fetch chunk texts from PostgreSQL
     context_parts = []
     chunk_ids_used = []
 
-    for placeholder, _ in results:
+    for placeholder, _dist in relevant:
         try:
-            doc_id_str, chunk_idx_str = placeholder.split("_")
+            doc_id_str, chunk_idx_str = placeholder.rsplit("_", 1)
             did = UUID(doc_id_str)
             cidx = int(chunk_idx_str)
             q = select(DocumentChunk).where(
@@ -243,11 +273,7 @@ async def answer_query(
         except Exception:
             logger.warning("Failed to parse FAISS placeholder: %s", placeholder)
 
-    context = (
-        "\n\n".join(context_parts)
-        if context_parts
-        else "No documents uploaded yet."
-    )
+    context = "\n\n".join(context_parts) if context_parts else NO_CONTEXT_MARKER
 
     # 4. Build conversation history string
     history_msgs = await _get_recent_history(db, cid)
